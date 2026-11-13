@@ -231,9 +231,26 @@ The query of the URL holds the session parameters, for example
 `?sample_seed=0&rollout_id=run1`. Without `sample_seed`, each session draws a
 random seed.
 
-The default session is the chunked schedule. Real-time chunking is opt-in
-with `schedule=rtc` in the query (see "Real-time chunking"); it needs
-Positronic 0.4.4 or later.
+The default session is the chunked call (`schedule: chunked` in the shipped
+configs). `schedule=periodic_chunked` serves the chunked schedule over
+Positronic's periodic flow. The client sends
+one small sample per tick, and the server keeps the history, encodes the
+window as the samples arrive and plans the trunk ahead. The answers equal the
+chunked call's on the same frames and seed; each chunk plays after the
+previous one, as with the chunked call.
+
+**The client needs Positronic with the periodic components** (`periodic`,
+`inference_schedule`, `trajectory_player` and the `after_previous` merge),
+first released in 0.4.4. An older client stops at the handshake with "This
+client cannot build the client stack that the server declares". Such a client
+asks for the chunked call with `schedule=chunked` in the query, or upgrades
+Positronic. A config that sets a periodic default (`schedule:
+periodic_chunked` or `rtc`) serves it to every session whose query sets no
+schedule; a stateless session (`max_context_chunks=0`) or a short
+`exec_horizon` gets the chunked call under such a default.
+
+Real-time chunking is opt-in with `schedule=rtc` in the query (see
+"Real-time chunking").
 
 ## Serve an SO-100 / SO-101 checkpoint
 
@@ -364,7 +381,7 @@ The session parameters of real-time chunking:
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `schedule` | `chunked` | `rtc` turns real-time chunking on (Positronic 0.4.4 or later). |
+| `schedule` | `chunked` | `periodic_chunked` serves the chunked answers over the periodic flow, `rtc` turns real-time chunking on (both Positronic 0.4.4 or later); `chunked` is the chunked call. |
 | `rtc_stride` | 12 | Rows between two predictions (1 to 20). |
 | `rtc_rebase_decay` | 24 | Rows over which the junction offset goes back to zero (0 keeps it). |
 | `rtc_vel_fade` | 6 | Rows over which the velocity fades from the plan to the model (0 turns it off). |

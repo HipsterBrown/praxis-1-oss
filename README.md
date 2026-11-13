@@ -603,15 +603,15 @@ The extras of `pyproject.toml`:
 | `thor` | Quack 0.6.5 with CUDA 13 support | SM110 NVFP4 backend and optional CuTe BF16 expert kernels |
 | `dev` | pytest, ruff | the tests |
 
-The policy server serves the chunked schedule by default (`schedule: chunked`
-in `configs/serve_*.yaml`). Real-time chunking is opt-in: a client asks for it
-with `?schedule=rtc` in the session URL (see "Real-time chunking" in
-`praxis/serve/README.md`). It needs Positronic 0.4.4 or later. A real-time
-session precomputes the window encode and the trunk passes of each
-prediction on the samples before it, with the same answer bits
-(`precompute: on`; `?precompute=off` turns it off). The precompute applies
-to real-time sessions only. A default session is chunked: it does not use
-the precompute and is not faster with it.
+The policy server serves the chunked call by default (`schedule: chunked`
+in `configs/serve_*.yaml`). `?schedule=periodic_chunked` serves the chunked
+schedule over Positronic's periodic flow, with the answers of the chunked call, and `?schedule=rtc` real-time chunking
+(see "Connect a Positronic client" in `praxis/serve/README.md`). Both need a
+Positronic client with the periodic components (0.4.4 or later). A periodic session (`periodic_chunked` or `rtc`)
+precomputes the window encode and the trunk passes of each prediction on
+the samples before it, with the same answer bits (`precompute: on`;
+`?precompute=off` turns it off). The chunked call does not use the
+precompute.
 
 The text encoder runs Qwen3.5 through `transformers`. If you install
 `flash-linear-attention` and `causal-conv1d`, `transformers` uses their

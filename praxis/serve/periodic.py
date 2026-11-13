@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from praxis.robot_io import ACTION_CHUNK
+
 # The observation keys of the Positronic recipe.
 OBS_TIME_NS = "obs_time_ns"
 SAMPLE_INDEX = "sample_index"
@@ -203,6 +205,9 @@ class PredictGrid:
     last_index: int | None = None
     # (index, rows, call_id) of a first prediction that waits for its duration.
     _waiting: tuple[int, int, int] | None = None
+    # The chunk-end grid (the chunked schedule over the periodic flow): the wait
+    # is rounded up to whole rows, so each prediction stays on the row phase.
+    _whole_rows: bool = False
 
     def reset(self) -> None:
         self.next_index = None
@@ -220,13 +225,28 @@ class PredictGrid:
             return True
         return self.next_index is None or index >= self.next_index
 
-    def predicted(self, index: int, rows: int, call_id: int | None) -> None:
-        """Record a prediction at sample ``index`` that the client plays for ``rows`` rows."""
+    def predicted(
+        self,
+        index: int,
+        rows: int,
+        call_id: int | None,
+        every_answer: bool = False,
+    ) -> None:
+        """Record a prediction at sample ``index`` that the client plays for ``rows`` rows.
+
+        ``every_answer`` (the chunked schedule over the periodic flow): every
+        chunk starts when its answer is read, so every prediction, not only the
+        first, waits for its call's duration. Until it arrives, ``next_index``
+        is the end of the chunk, so the precompute works on that window.
+        """
         rows = max(int(rows), 1)
         first = self.next_index is None
         self.last_index = int(index)
-        if first and call_id is not None:
+        if (first or every_answer) and call_id is not None:
             self._waiting = (int(index), rows, int(call_id))
+            if every_answer:
+                self._whole_rows = True
+                self.next_index = int(index) + self.ratio * rows
             return
         self.next_index = int(index) + self.ratio * rows
 
@@ -237,6 +257,10 @@ class PredictGrid:
         index, rows, _ = self._waiting
         self._waiting = None
         wait = round(float(elapsed_sec) * self.sample_fps)
+        if self._whole_rows:
+            # Above 15 Hz a wait that is not whole rows would put the prediction
+            # off the row phase (and restart the context): wait up to the row.
+            wait = -(-wait // self.ratio) * self.ratio
         self.next_index = index + self.ratio * rows + wait
 
 
@@ -294,7 +318,9 @@ class CallTimings:
         return out
 
 
-def client_recipe(base: dict, *, fps: float, sample_fps: float) -> dict:
+def client_recipe(
+    base: dict, *, fps: float, sample_fps: float, chunked: bool = False
+) -> dict:
     """Return ``base`` (the declared ``seq`` of the chunked recipe) as the periodic recipe.
 
     ``temporal_stack`` goes. ``chunked_schedule`` becomes
@@ -317,7 +343,10 @@ def client_recipe(base: dict, *, fps: float, sample_fps: float) -> dict:
                 {
                     "name": "trajectory_player",
                     "version": 1,
-                    "args": {"plan_key": PLAN, "replan_on_error": True},
+                    "args": {
+                        "plan_key": None if chunked else PLAN,
+                        "replan_on_error": True,
+                    },
                 },
                 {
                     "name": "periodic",
@@ -334,7 +363,16 @@ def client_recipe(base: dict, *, fps: float, sample_fps: float) -> dict:
                             "reference": "every",
                             "seconds": 1.0 / float(sample_fps),
                         },
-                        "merge": {"start": "observation", "horizon_sec": None},
+                        # rtc: each prediction starts at its observation.
+                        # chunked: after the previous chunk, cut at the chunk.
+                        "merge": (
+                            {
+                                "start": "after_previous",
+                                "horizon_sec": ACTION_CHUNK / float(fps),
+                            }
+                            if chunked
+                            else {"start": "observation", "horizon_sec": None}
+                        ),
                         "latency_estimate": 0.0,
                     },
                 },

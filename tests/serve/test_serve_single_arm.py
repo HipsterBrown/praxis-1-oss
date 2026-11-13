@@ -198,8 +198,10 @@ def test_meta_adds_the_variant() -> None:
     }
     assert meta["max_context_chunks"] == 1 and meta["num_evals"] == 2
     assert meta["t_shift"] == 12.5 and meta["cfg_batched"] is False
-    # The serve config's default is the chunked schedule (a chunked session states no
-    # schedule key); real-time chunking is opt-in.
+    # The serve config's default is the chunked call (no schedule key);
+    # periodic_chunked and real-time chunking are opt-in.
+    assert "schedule" not in meta
+    meta = _factory(SINGLE_ARM)[0]({"schedule": "chunked"}).meta
     assert "schedule" not in meta
     rtc_meta = _factory(SINGLE_ARM)[0]({"schedule": "rtc"}).meta
     assert rtc_meta["schedule"] == "rtc" and rtc_meta["precompute"] is True
@@ -279,6 +281,7 @@ def test_session_gets_the_sampler_and_settings_of_the_session() -> None:
             "max_context_chunks": 1,
             "control_mode": "none",
             "prompt": "pick the cube",
+            "schedule": "chunked",  # the chunked call: no precompute session kwarg
         }
     )
     kwargs = pipe.sessions[-1]
@@ -339,9 +342,17 @@ def test_antialiased_canvas_declares_the_fit_serve_stack() -> None:
         "temporal_stack",
         "chunked_schedule",
     ]
-    # The default is that chunked stack; schedule=rtc declares the periodic recipe,
-    # the restrict in its place.
+    # The default is that chunked stack; periodic_chunked declares the periodic
+    # recipe, as schedule=rtc does, the restrict in its place.
     assert factory({}).meta["local_stack"]["seq"] == seq
+    pch = factory({"schedule": "periodic_chunked"}).meta["local_stack"]["seq"]
+    assert [e["name"] for e in pch] == [
+        "stop_on_fault",
+        "restrict_image_size",
+        "trajectory_player",
+        "periodic",
+        "inference_schedule",
+    ]
     rtc_seq = factory({"schedule": "rtc"}).meta["local_stack"]["seq"]
     assert [e["name"] for e in rtc_seq] == [
         "stop_on_fault",
@@ -385,6 +396,9 @@ def test_factory_serves_the_bimanual_rig() -> None:
     ]
     assert pipe.sessions[-1]["control_mode"] == "none"
     assert "schedule" not in meta  # the chunked default
+    assert (
+        factory({"schedule": "periodic_chunked"}).meta["schedule"] == "periodic_chunked"
+    )
     assert factory({"schedule": "rtc"}).meta["schedule"] == "rtc"
     seq = factory({"schedule": "chunked"}).meta["local_stack"]["seq"]
     # The YAM client order: the stack, then the restrict; half-frame offsets.
