@@ -226,7 +226,12 @@ def test_the_lerobot_client_session(server: tuple[str, PolicyFactory]) -> None:
         assert meta["canvas_native"] == [288, 832] and meta["pose_frame"] == "joints"
         stack = [e for e in meta["local_stack"]["seq"] if e["name"] == "temporal_stack"]
         assert stack[0]["args"]["keys"] == ["image.exterior", "image.wrist", "state"]
-        assert len(stack[0]["args"]["offsets_sec"]) == 25
+        # The rows of the executed chunk, oldest first, each half a frame late,
+        # so that a Positronic stack picks the entry of each row.
+        offsets = stack[0]["args"]["offsets_sec"]
+        np.testing.assert_allclose(
+            offsets, [-(24 - k) / 15 + 1 / 30 for k in range(24)] + [0.0]
+        )
         names = [e["name"] for e in meta["local_stack"]["seq"]]
         assert names == [
             "stop_on_fault",
@@ -820,6 +825,7 @@ def test_the_lerobot_client_runs_a_fake_robot_against_the_server(
     )
     assert spec is not None and spec.loader is not None
     client = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = client  # dataclasses look their module up by name
     spec.loader.exec_module(client)
     addr, factory = server
     log = tmp_path / "log.jsonl"

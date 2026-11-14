@@ -7,10 +7,10 @@ import collections
 import http.client
 import importlib.util
 import json
+import sys
 import types
 from pathlib import Path
 
-import msgpack
 import numpy as np
 import pytest
 
@@ -24,6 +24,7 @@ def client() -> types.ModuleType:
     spec = importlib.util.spec_from_file_location("so101_client", CLIENT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses look their module up by name
     spec.loader.exec_module(module)
     return module
 
@@ -43,31 +44,35 @@ def test_frames_fit_the_416_box_and_never_upscale(client: types.ModuleType) -> N
     assert client.fit_frame(small) is small
 
 
-def test_the_request_is_the_stack_of_the_server(client: types.ModuleType) -> None:
-    rng = np.random.default_rng(0)
-    entries = [
-        {
-            "state": np.arange(6, dtype=np.float64) + t,
-            "exterior": rng.integers(0, 255, (312, 416, 3), dtype=np.uint8),
-            "wrist": rng.integers(0, 255, (312, 416, 3), dtype=np.uint8),
-        }
-        for t in range(3)
-    ]
-    raw = client.build_request(entries, ["exterior", "wrist"], "Pick up the cube.", 90)
-    msg = msgpack.unpackb(raw, strict_map_key=False)
-    assert msg["task"] == "Pick up the cube."
-    state = msg["state"]
-    assert state[b"shape"] == [3, 6] and np.dtype(state[b"dtype"]) == np.float32
-    np.testing.assert_array_equal(
-        np.frombuffer(state[b"data"], np.float32).reshape(3, 6)[2], np.arange(6) + 2
+def test_the_codec_gives_the_server_the_readings_and_takes_its_rows(
+    client: types.ModuleType,
+) -> None:
+    """Positronic's radians and closure go to the server as the LeRobot readings,
+    and the server's rows come back as the same float32 targets, bit for bit."""
+    sp = client
+    grip = sp.Grip(3.8, 37.3)
+    deg = np.array([12.5, -98.7, 95.1, 70.3, -0.4, 21.0], np.float32)
+    obs = sp.observation(
+        deg.astype(np.float64), {"exterior": np.zeros((4, 4, 3), np.uint8)}, "p", grip
     )
-    for view in ("image.exterior", "image.wrist"):
-        assert msg[view][b"__jpeg__"] is True and len(msg[view][b"frames"]) == 3
-    one = msgpack.unpackb(
-        client.build_request(entries, ["exterior"], "x", 90), strict_map_key=False
+    assert set(obs) == {"robot_state.q", "grip", "task", "image.exterior"}
+    sent = sp.So101Codec(grip).encode(dict(obs))
+    assert sent["state"].dtype == np.float32 and set(sent) == {
+        "state",
+        "task",
+        "image.exterior",
+    }
+    np.testing.assert_array_equal(sent["state"], deg)
+    rows = sp.So101Codec(grip).decode([{"joints": deg, "timestamp": 0.0}])
+    assert set(rows[0]) == {"robot_command", "target_grip"}
+    np.testing.assert_array_equal(np.float32(sp.targets(rows[0], grip)), deg)
+    assert sp.targets({}, grip) is None
+    assert sp.wire_address("wss://h/api/v1/session", "views=1") == (
+        "websocket_tls",
+        sp.HostPortAddress("h", 443, "/api/v1/session", "views=1"),
     )
-    assert "image.wrist" not in one
-    assert len(raw) <= client.MAX_MESSAGE_BYTES
+    with pytest.raises(ValueError, match="expected"):
+        sp.wire_address("ws://h/x", "")
 
 
 def test_the_clamp_is_off_by_default_and_limits_each_row(
@@ -156,9 +161,13 @@ def test_a_stalled_read_slows_the_rows_down_instead_of_bursting_them(
     anchor = {"state": start}
     hist: collections.deque = collections.deque()
 
-    last = client.play_rows(
-        robot, rows, start, anchor, hist, [], sub, period, dry=False, paced=True
-    )
+    last, tick = start, clock.t
+    for i, row in enumerate(rows):
+        hist.append(
+            anchor if i == 0 else {"state": client.read_entry(robot, [])["state"]}
+        )
+        tick = client.send_row(robot, last, row, sub, period, tick, False, paced=True)
+        last = row
 
     np.testing.assert_array_equal(last, rows[-1])
     assert len(hist) == len(rows) and hist[0] is anchor
@@ -203,8 +212,7 @@ def test_the_session_url_uses_the_server_parameter_names(
     )  # fmt: skip
     assert a.dry_run and a.control_hz == 30.0 and a.max_step_deg is None
     assert not a.hold_torque_on_exit and a.max_relative_target is None
-    url = client.session_url(a, 1)
-    query = url.split("?", 1)[1]
+    query = client.session_query(a, 1)
     assert "views=1" in query and "prompt=Pick+up+the+cube" in query
     assert "grip_closed=3.8" in query and "grip_open=37.3" in query
     assert "max_context_chunks=2" in query and "num_steps=4" in query
@@ -379,22 +387,6 @@ def test_the_rest_pose_flag_and_the_new_defaults(client: types.ModuleType) -> No
             client.parse_args([*base, "--rest-pose", bad])
 
 
-def test_a_stop_request_ends_a_chunk_before_the_next_row(
-    client: types.ModuleType,
-) -> None:
-    arm = _Arm(client.JOINTS, np.zeros(6))
-    rows = np.cumsum(np.ones((8, 6)), axis=0)
-    hist: collections.deque = collections.deque()
-    asked = iter([False, False, False, True])
-    with pytest.raises(client.StopRun):
-        client.play_rows(
-            arm, rows, np.zeros(6), {"state": np.zeros(6)}, hist, [], 2, 1 / 30,
-            dry=False, paced=False, stop=lambda: next(asked),
-        )  # fmt: skip
-    assert len(hist) == 3 and len(arm.sent) == 3 * 2
-    np.testing.assert_array_equal(arm.q, rows[2])
-
-
 # ---------------------------------------------------------------------------
 # The page
 # ---------------------------------------------------------------------------
@@ -510,8 +502,10 @@ def test_the_stream_is_mjpeg_of_the_latest_frame(client: types.ModuleType) -> No
 
 
 class _Server:
-    """A fake praxis server: each connection gets ``ready``, then one chunk
-    per request that lifts the arm 1 deg per row. ``on_request`` runs on each
+    """A fake praxis server behind the Positronic run of the client
+    (``so101_positronic.PolicyRun``): each session asks for one chunk on its
+    first step and again when the chunk is played, as the chunked schedule
+    does. Each chunk lifts the arm 1 deg per row. ``on_request`` runs on each
     request. Request number ``fail_at`` gets an error answer."""
 
     def __init__(
@@ -520,42 +514,50 @@ class _Server:
         self.client, self.on_request, self.fail_at = client, on_request, fail_at
         self.tasks: list[str] = []
         self.anchors: list[np.ndarray] = []
-        self.inbox: list[bytes] = []
+        self.meta: dict = {"schedule": "chunked"}
 
-    def __enter__(self) -> _Server:
-        ready = {"status": "ready", "meta": {"stack_entries": 25}}
-        self.inbox = [self.client.dumps(ready)]
-        return self
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server, sp = self, self.client
 
-    def __exit__(self, *exc: object) -> None:
-        pass
+        def make_policy(url, query, grip, log, clock, **_: object) -> object:
+            return (grip, log)
 
-    def send(self, raw: bytes) -> None:
-        msg = self.client.loads(raw)
-        state = np.asarray(msg["state"], np.float64)[-1]
-        self.tasks.append(msg["task"])
-        self.anchors.append(state)
-        if self.on_request is not None:
-            self.on_request(len(self.tasks))
-        if len(self.tasks) == self.fail_at:
-            self.inbox.append(self.client.dumps({"error": "boom"}))
-            return
-        rows = np.tile(state, (24, 1))
-        rows[:, 1] += np.arange(1, 25)
-        self.inbox.append(
-            self.client.dumps(
-                {
-                    "actions": rows.astype(np.float32),
-                    "effective_prompt": msg["task"],
-                    "server_timing": {"policy_ms": 5.0},
-                }
-            )
-        )
+        class Run:
+            def __init__(
+                self, policy: object, clock: object, virtual: bool = False
+            ) -> None:
+                self.grip, self.log = policy
+                self.left = 0  # the rows left of the chunk that plays
+                self.pending = False
 
-    def recv(self, timeout: float | None = None) -> bytes:
-        if not self.inbox:
-            raise TimeoutError
-        return self.inbox.pop(0)
+            def open(self, stop: object) -> dict:
+                return dict(server.meta)
+
+            def step(self, obs: dict) -> tuple[list[dict], int]:
+                if self.left == 0:
+                    state = sp.So101Codec(self.grip).encode(dict(obs))["state"]
+                    state = np.asarray(state, np.float64)
+                    server.tasks.append(obs["task"])
+                    server.anchors.append(state)
+                    if server.on_request is not None:
+                        server.on_request(len(server.tasks))
+                    if len(server.tasks) == server.fail_at:
+                        raise RuntimeError("Server error: boom")
+                    self.rows = np.tile(state, (24, 1))
+                    self.rows[:, 1] += np.arange(1, 25)
+                    self.log.add(sp.Call(self.rows, 0.005, {"infer_ms": 5.0},
+                                         obs["task"], state, 1))  # fmt: skip
+                    self.left = 24
+                row = self.rows[24 - self.left]
+                self.left -= 1
+                cmd = sp.So101Codec(self.grip).decode({sp.COMMAND_KEY: row})
+                return [cmd], 0
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(sp, "make_policy", make_policy)
+        monkeypatch.setattr(sp, "PolicyRun", Run)
 
 
 def _run(
@@ -573,8 +575,7 @@ def _run(
     buttons come from ``script``, one per wait of the client; Ctrl-C comes
     when the script is over. ``waits`` gets the status of the page and the
     pose of the arm at each wait."""
-    wsc = pytest.importorskip("websockets.sync.client")
-    monkeypatch.setattr(wsc, "connect", lambda *a, **k: server)
+    server.install(monkeypatch)
     monkeypatch.setattr(client, "make_robot", lambda a, cams: arm)
     monkeypatch.setattr(client, "time", _Clock())
     made = [] if pages is None else pages
@@ -685,7 +686,7 @@ def test_the_buttons_start_stop_and_return_to_rest(
     # at request 2 the page still shows the prompt of the answer to request 1
     assert seen[1]["effective_prompt"] == old and seen[1]["prompt"] == new
     assert seen[2]["effective_prompt"] == new and seen[2]["mode"] == "running"
-    assert seen[2]["phase"] == "waiting for the chunk" and seen[2]["chunk"] == 2
+    assert seen[2]["phase"] == "running" and seen[2]["chunk"] == 1
     assert seen[2]["rows"] == 24 and seen[2]["policy_ms"] == 5
     assert seen[2]["views"] == ["exterior"] and len(seen[2]["state"]) == 6
     # wait 1: before Start. wait 2: after Stop, where chunk 1 ended.
@@ -991,3 +992,24 @@ def test_ctrl_c_in_a_rest_move_of_the_page_stops_the_arm(
     assert len(server.tasks) == 1 and arm.connected is False
     assert len(arm.sent) == arm.stopped_at + 1  # only the hold after Ctrl-C
     assert arm.q[1] > REST[1] + 5.0  # not at rest: the move did not run again
+
+
+def test_a_server_with_on_grid_offsets_is_refused_before_a_request(
+    client: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server that declares the stack offsets on the row grid (an so101 server
+    from before the half-frame offsets) ends the session at open, with no
+    request and no command of the policy."""
+    rest = [0.0, -100.0, 95.0, 70.0, 0.0, 2.0]
+    arm = _Arm(client.JOINTS, rest, frames=("exterior",))
+    server = _Server(client)
+    on_grid = [-(24 - k) / 15 for k in range(24)] + [0.0]
+    server.meta = {
+        "action_fps": 15.0,
+        "local_stack": {
+            "seq": [{"name": "temporal_stack", "args": {"offsets_sec": on_grid}}]
+        },
+    }
+    with pytest.raises(SystemExit, match="Redeploy the so101 server"):
+        _run(client, monkeypatch, arm, server, ["--grip-closed", "2"])
+    assert server.tasks == [] and arm.connected is False

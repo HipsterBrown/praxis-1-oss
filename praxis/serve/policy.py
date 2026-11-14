@@ -213,8 +213,11 @@ RESTRICT_SQUARE: dict[str, tuple[bool, bool]] = {
     # computer), with half-frame offsets.
     "bimanual": (False, True),
     # The LeRobot client fits each frame as it reads it and records one entry
-    # per executed row, on the row clock.
-    "so101": (True, False),
+    # per executed row, on the row clock. The offsets are half a frame late:
+    # a Positronic temporal stack picks the latest entry at or before each
+    # offset, and an offset on the row grid picks the row before when the
+    # clock is early by a few ns.
+    "so101": (True, True),
 }
 
 

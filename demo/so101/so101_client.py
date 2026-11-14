@@ -4,9 +4,12 @@
 The remote client of a praxis serve endpoint on an so101 checkpoint
 (``python -m praxis.serve --config configs/serve_so101.yaml`` on a local
 GPU, for example a 5090 with ``routed_precision: nvfp4``, or the Modal app).
-It is one file without a praxis import: next to the robot it needs
-``lerobot`` (with the Feetech extra), ``numpy``, ``msgpack``, ``websockets``
-and ``Pillow``.
+It has no praxis import. It runs Positronic's client (``RemotePolicy``,
+the section "the Positronic client" below): the server declares the client stack in its
+handshake and the client builds it, so the client runs each schedule of the
+server (``chunked``, ``periodic_chunked``, ``rtc``). Next to the robot it
+needs ``lerobot`` (with the Feetech extra), ``positronic`` 0.4.4 or later,
+``numpy`` and ``Pillow``.
 
     python demo/so101/so101_client.py \\
         --url ws://<host>:8000/api/v1/session \\
@@ -14,21 +17,22 @@ and ``Pillow``.
         --exterior-cam 0 [--wrist-cam 2] \\
         --grip-closed 1.4 --grip-open 42.1 \\
         --prompt "Pick up the red cube and put it in the box." \\
+        [--session '{"schedule": "periodic_chunked"}'] \\
         [--dry-run] [--control-hz 30] [--max-step-deg 4] [--ui-port 8780]
 
 A Modal endpoint takes its proxy auth headers from ``--headers-file`` (a JSON
 file with ``Modal-Key`` and ``Modal-Secret``).
 
-Observation contract (what the client sends): the frame stack that the
-server declares in its handshake, one entry per executed 15 Hz row, oldest
-first, the current entry last: ``state`` ``(T, 6)`` = the follower's
+The loop: on each 15 Hz row the client reads one entry, the follower's
 ``shoulder_pan.pos .. wrist_roll.pos`` in degrees (``use_degrees=True``, the
-LeRobot default) and ``gripper.pos`` in 0..100; ``image.exterior`` and (with
-``--wrist-cam``) ``image.wrist``, each frame bounded to a 416x416 box with
-its aspect kept (a 640x480 camera sends 416x312), as JPEG. The client
-records one entry per 15 Hz row of the executed chunk, on the execution
-clock, so the stack holds the rows the model trained on (``stack_entries``
-of the handshake: 25 for the default context of one chunk).
+LeRobot default), ``gripper.pos`` in 0..100 and the frame of each view
+(``image.exterior`` and, with ``--wrist-cam``, ``image.wrist``) bounded to a
+416x416 box with its aspect kept (a 640x480 camera gives 416x312). The
+declared stack does the rest: the chunked schedule stacks the entries of the
+executed chunk (``stack_entries`` of the handshake, 25 for one context chunk)
+and asks at the end of each chunk; ``periodic_chunked`` and ``rtc`` send each
+entry as it comes and the server keeps the stack. The client sends the
+frames as JPEG at ``--jpeg-quality`` (90).
 
 Model space (the server's business, ``praxis/so101.py``): radians and a
 gripper closure 0..1 between the readings ``--grip-closed`` (closure 1) and
@@ -38,16 +42,16 @@ training data, not a rule of LeRobot: give the readings of your follower
 (``--measure-grip`` reads them with the torque off), ``closed > open`` is
 fine. The defaults 1.4 / 42.1 are the training medians, to be replaced.
 
-Command contract (what the client plays): the answer's ``actions``
-``(R, 6)``, absolute targets in the units of ``state``, one row per 1/15 s
-(21 rows on the first chunk of a context, 24 after). ``--control-hz`` (30 by
-default, the LeRobot control rate) sends the arm a linear interpolation
-between the 15 Hz rows. A deadline that passed during a stall (a camera
-read, a GC pause) slips: the client slows down, it never sends the overdue
-rows back to back. Safety is LeRobot's: ``--max-relative-target``
-(the follower's ``max_relative_target``, LeRobot's own cap per command);
-``--max-step-deg`` / ``--max-grip-step`` add a per-row clamp of the client
-(off by default).
+Command contract (what the client plays): the rows of each answer, absolute
+targets in the units of the readings, one row per 1/15 s (21 rows on the
+first chunk of a context, 24 after), as the stack's trajectory player times
+them. ``--control-hz`` (30 by default, the LeRobot control rate) sends the
+arm a linear interpolation between the 15 Hz rows. A deadline that passed
+during a stall (a camera read, a GC pause) slips: the client slows down, it
+never sends the overdue rows back to back. Safety is LeRobot's:
+``--max-relative-target`` (the follower's ``max_relative_target``, LeRobot's
+own cap per command); ``--max-step-deg`` / ``--max-grip-step`` add a per-row
+clamp of the client (off by default).
 
 Rest pose: the client moves the arm to the folded rest pose of the training
 episodes before the first chunk, and back to it when the client ends
@@ -76,8 +80,8 @@ the session or the rest move that runs, and the arm holds its position;
 ``Return to rest`` moves the arm to the rest pose. No button ends the
 client: Ctrl-C does, and the arm then returns to the rest pose. With the
 page, ``--max-chunks`` or a problem of the server ends the session, not the
-client. A new prompt goes out with the next chunk request (the ``task`` of
-the request); the page shows the prompt that the server answers with. The
+client. A new prompt goes out with the next request (the ``task`` of the
+request); the page shows the prompt of the last answer with rows. The
 page has no password: keep the default host.
 
 ``--dry-run`` prints the targets and never moves the arm (no rest move);
@@ -88,7 +92,7 @@ follows the commands), for a test of the endpoint.
 from __future__ import annotations
 
 import argparse
-import collections
+import collections.abc as cabc
 import contextlib
 import io
 import json
@@ -96,15 +100,23 @@ import signal
 import sys
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-import msgpack
 import numpy as np
+from positronic import keys
+from positronic.drivers.roboarm import command
+from positronic.policy.codecs import Codec
+from positronic.policy.executor import Executor, WaitStatus
+from positronic.policy.remote import RemotePolicy
+from positronic.policy.sequential import Sequential
+from positronic_wire.wire import SESSION_PATH, HostPortAddress
 
 JOINTS = (
     "shoulder_pan",
@@ -157,43 +169,11 @@ MAX_PROMPT_CHARS = 500
 # The training medians of the gripper readings at closure 1 / 0.
 DEFAULT_GRIP_CLOSED = 1.4
 DEFAULT_GRIP_OPEN = 42.1
-MAX_MESSAGE_BYTES = int(1.9 * 1024 * 1024)
 # The session parameters of the server that the client sets from its flags.
 SESSION_FLAGS = ("grip_closed", "grip_open", "max_context_chunks", "exec_horizon")
 
 
-# -- wire (positronic msgpack numpy / JPEG records) ----------------------------
-
-
-def _pack(obj: object) -> object:
-    if isinstance(obj, np.ndarray):
-        return {b"__ndarray__": True, b"data": obj.tobytes(), b"dtype": obj.dtype.str,
-                b"shape": obj.shape}  # fmt: skip
-    if isinstance(obj, np.generic):
-        return {b"__npgeneric__": True, b"data": obj.item(), b"dtype": obj.dtype.str}
-    return obj
-
-
-def _unpack(obj: dict) -> object:
-    if b"__ndarray__" in obj:
-        return np.ndarray(buffer=obj[b"data"], dtype=np.dtype(obj[b"dtype"]),
-                          shape=obj[b"shape"])  # fmt: skip
-    if b"__npgeneric__" in obj:
-        return np.dtype(obj[b"dtype"]).type(obj[b"data"])
-    return obj
-
-
-def dumps(x: object) -> bytes:
-    return msgpack.packb(x, default=_pack)
-
-
-def loads(b: bytes) -> Any:
-    return msgpack.unpackb(b, object_hook=_unpack, strict_map_key=False)
-
-
-def _s(d: Any, k: str) -> Any:
-    """The value of ``k`` in a decoded message (str or bytes keys)."""
-    return d[k] if k in d else d.get(k.encode())
+# -- frames ----------------------------------------------------------------------
 
 
 def fit_frame(frame: np.ndarray, side: int = FIT_SIDE) -> np.ndarray:
@@ -210,32 +190,298 @@ def fit_frame(frame: np.ndarray, side: int = FIT_SIDE) -> np.ndarray:
     )
 
 
-def jpeg(frames: list[np.ndarray], quality: int) -> dict:
-    from PIL import Image
+# -- the Positronic client ----------------------------------------------------
 
-    out = []
-    for f in frames:
-        buf = io.BytesIO()
-        Image.fromarray(f).save(buf, format="JPEG", quality=quality)
-        out.append(buf.getvalue())
-    return {b"__jpeg__": True, b"frames": out, b"ndim": 4}
+#: Degrees to radians.
+DEG = np.pi / 180.0
+N_ARM = 5
+#: The observation key and the command key of the so101 server.
+STATE_KEY = "state"
+COMMAND_KEY = "joints"
+VIEW_KEYS = {"exterior": "image.exterior", "wrist": "image.wrist"}
+#: How long one wait for an answer of a virtual-clock session blocks before it checks again.
+ANSWER_POLL_S = 1.0
 
 
-def build_request(
-    entries: list[dict], views: list[str], prompt: str, quality: int
-) -> bytes:
-    """The stack (oldest first; the last entry is the current one) as one
-    msgpack request, the JPEG quality lowered until it fits a 2 MB message."""
-    state = np.stack([e["state"] for e in entries]).astype(np.float32)
-    q = quality
-    while True:
-        msg = {"state": state, "task": prompt}
-        for v in views:
-            msg[f"image.{v}"] = jpeg([e[v] for e in entries], q)
-        raw = dumps(msg)
-        if len(raw) <= MAX_MESSAGE_BYTES or q <= 40:
-            return raw
-        q -= 10
+@dataclass(frozen=True)
+class Grip:
+    """The follower's ``gripper.pos`` at closure 1 (``closed``) and at closure 0 (``open``)."""
+
+    closed: float
+    open: float
+
+    def closure(self, pos: float) -> float:
+        return (self.open - pos) / (self.open - self.closed)
+
+    def position(self, closure: float) -> float:
+        return self.open - closure * (self.open - self.closed)
+
+
+def observation(
+    deg: np.ndarray, frames: cabc.Mapping[str, np.ndarray], prompt: str, grip: Grip
+) -> dict[str, Any]:
+    """The Positronic observation of one reading: ``deg`` is the LeRobot reading
+    (5 joints in degrees and ``gripper.pos``), ``frames`` the RGB frame of each view."""
+    q = np.asarray(deg, np.float64)
+    obs: dict[str, Any] = {
+        keys.JOINTS: q[:N_ARM] * DEG,
+        keys.GRIP: grip.closure(float(q[N_ARM])),
+        keys.TASK: prompt,
+    }
+    for view, frame in frames.items():
+        obs[VIEW_KEYS[view]] = frame
+    return obs
+
+
+def targets(commands: cabc.Mapping[str, Any], grip: Grip) -> np.ndarray | None:
+    """The LeRobot target ``(6,)`` of Positronic commands, or None without an arm command.
+
+    The values are rounded to float32: the server answers float32 targets, and
+    the rounding gives back its bits after the conversion to radians.
+    """
+    joint = commands.get(keys.ROBOT_COMMAND)
+    if joint is None:
+        return None
+    if not isinstance(joint, command.JointPosition):
+        raise TypeError(f"the SO-101 takes joint positions, not {type(joint).__name__}")
+    out = np.empty(N_ARM + 1, np.float64)
+    out[:N_ARM] = (np.asarray(joint.positions, np.float64) / DEG).astype(np.float32)
+    out[N_ARM] = np.float32(grip.position(float(commands[keys.TARGET_GRIP])))
+    return out
+
+
+class So101Codec(Codec):
+    """Positronic's SO-101 keys and units to the ``state`` and ``joints`` of a praxis so101 server."""
+
+    def __init__(self, grip: Grip) -> None:
+        self._grip = grip
+
+    def encode(self, data: dict) -> dict:
+        out = {k: v for k, v in data.items() if k not in (keys.JOINTS, keys.GRIP)}
+        state = np.empty(N_ARM + 1, np.float64)
+        state[:N_ARM] = np.asarray(data[keys.JOINTS], np.float64) / DEG
+        state[N_ARM] = self._grip.position(float(data[keys.GRIP]))
+        out[STATE_KEY] = state.astype(np.float32)
+        return out
+
+    def _decode_single(self, data: dict) -> dict:
+        if COMMAND_KEY not in data:
+            return {}
+        row = np.asarray(data[COMMAND_KEY], np.float64)
+        return {
+            keys.ROBOT_COMMAND: command.JointPosition(row[:N_ARM] * DEG),
+            keys.TARGET_GRIP: self._grip.closure(float(row[N_ARM])),
+        }
+
+
+def wire_address(url: str, query: str) -> tuple[str, HostPortAddress]:
+    """The Positronic wire and the session address of ``url`` (``ws[s]://host[:port]/api/v1/session[/<model>]``)
+    with the session parameters ``query``."""
+    split = urllib.parse.urlsplit(url)
+    if split.scheme not in ("ws", "wss", "http", "https") or not split.hostname:
+        raise ValueError(f"expected ws[s]://<host>[:port]{SESSION_PATH}, got {url!r}")
+    path = split.path.rstrip("/") or SESSION_PATH
+    if path != SESSION_PATH and not path.startswith(f"{SESSION_PATH}/"):
+        raise ValueError(f"expected the path {SESSION_PATH}[/<model>], got {path!r}")
+    secure = split.scheme in ("wss", "https")
+    port = split.port if split.port is not None else (443 if secure else 80)
+    wire = "websocket_tls" if secure else "websocket"
+    return wire, HostPortAddress(split.hostname, port, path, query)
+
+
+def on_grid_offsets(meta: cabc.Mapping[str, Any]) -> list[float]:
+    """The past offsets of a declared ``temporal_stack`` on the row grid of ``action_fps``.
+
+    A Positronic stack picks the latest entry at or before each offset, so an
+    offset on the row grid picks the row before on a clock a few ns early. The
+    chunked schedule declares the stack; ``periodic_chunked`` and ``rtc`` do not.
+    """
+    fps = float(meta.get("action_fps") or 15.0)
+    out: list[float] = []
+    for entry in (meta.get("local_stack") or {}).get("seq") or []:
+        if entry.get("name") == "temporal_stack":
+            for o in entry.get("args", {}).get("offsets_sec", []):
+                if o < 0 and abs(o * fps - round(o * fps)) < 1e-6:
+                    out.append(float(o))
+    return out
+
+
+@dataclass
+class Call:
+    """One answer with rows: the LeRobot targets ``(R, 6)``, the round trip, the
+    server's timing, the prompt and the newest state of the request."""
+
+    rows: np.ndarray
+    seconds: float
+    served: dict[str, float]
+    prompt: str
+    anchor: np.ndarray
+    stack: int
+
+
+@dataclass
+class CallLog:
+    """The answers with rows, in the order they arrive. The calls run on worker threads."""
+
+    calls: list[Call] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def add(self, call: Call) -> None:
+        with self.lock:
+            self.calls.append(call)
+
+    def since(self, n: int) -> list[Call]:
+        with self.lock:
+            return self.calls[n:]
+
+
+class _LoggedSession:
+    """An inference session that logs each answer with rows to a :class:`CallLog`."""
+
+    def __init__(self, inner: Any, log: CallLog, clock: Callable[[], int]) -> None:
+        self._inner, self._log, self._clock = inner, log, clock
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def infer(self, obs: dict[str, Any]) -> Any:
+        started = self._clock()
+        result = self._inner.infer(obs)
+        if isinstance(result, list) and result:
+            state = np.asarray(obs[STATE_KEY], np.float64)
+            prompt = obs.get(keys.TASK, "")
+            self._log.add(
+                Call(
+                    rows=np.stack(
+                        [np.asarray(r[COMMAND_KEY], np.float64) for r in result]
+                    ),
+                    seconds=(self._clock() - started) / 1e9,
+                    served=dict(self._inner.served_timing),
+                    prompt=prompt.decode()
+                    if isinstance(prompt, bytes)
+                    else str(prompt),
+                    anchor=state.reshape(-1, N_ARM + 1)[-1],
+                    stack=len(state) if state.ndim == 2 else 1,
+                )
+            )
+        return result
+
+
+def make_policy(
+    url: str,
+    query: str,
+    grip: Grip,
+    log: CallLog,
+    clock: Callable[[], int],
+    *,
+    headers: dict[str, str] | None,
+    connect_timeout: float,
+    recv_timeout: float,
+    jpeg_quality: int,
+) -> Sequential:
+    """The client policy: :class:`So101Codec` in front of ``RemotePolicy`` on ``url``.
+    Each answer with rows goes to ``log``."""
+    wire, address = wire_address(url, query)
+    remote = RemotePolicy(
+        wire,
+        address,
+        headers=headers,
+        connect_deadline=connect_timeout,
+        infer_timeout=recv_timeout,
+        jpeg_quality=jpeg_quality,
+    )
+    # HACK: RemotePolicy has no hook for its session. The RoboLab client of this
+    # repository (eval/robolab/positronic_cfg) wraps the session the same way.
+    new_session = remote._client.new_session
+    remote._client.new_session = lambda: _LoggedSession(new_session(), log, clock)
+    return Sequential(So101Codec(grip), remote)
+
+
+class PolicyRun:
+    """One server session: the policy run on Positronic's ``Executor``.
+
+    ``virtual`` runs on a clock that stands still while a call runs (tests): each
+    step waits for the answers of its calls. On the real clock a step never waits.
+    """
+
+    def __init__(
+        self, policy: Sequential, clock: Callable[[], int], virtual: bool = False
+    ) -> None:
+        self.runtime = Executor(clock, simulated=virtual, charge_inference_time=False)
+        self._policy = policy
+        self._run: Any = None
+
+    def open(
+        self, stop: Callable[[], bool] | None, poll_s: float = 0.25
+    ) -> dict[str, Any]:
+        """Open the session (the connect and the handshake) and return the server's handshake meta.
+
+        ``stop`` is asked every ``poll_s`` seconds: True raises ``InterruptedError``,
+        and a session that opens later closes at once.
+        """
+        opened = threading.Event()
+        state: dict[str, Any] = {}
+        lock = threading.Lock()
+
+        def start() -> None:
+            try:
+                run = self.runtime.start(self._policy)
+            except BaseException as e:
+                state["error"] = e
+            else:
+                with lock:
+                    if state.get("abandoned"):
+                        self.runtime.close()
+                        run.close()
+                    else:
+                        state["run"] = run
+            opened.set()
+
+        threading.Thread(target=start, name="so101-connect", daemon=True).start()
+        while not opened.wait(poll_s):
+            if stop is not None and stop():
+                with lock:
+                    state["abandoned"] = True
+                raise InterruptedError("stopped while the session opened")
+        if "error" in state:
+            raise state["error"]
+        self._run = state["run"]
+        return dict(self.runtime.metadata_snapshot().get("server", {}))
+
+    @property
+    def pending(self) -> bool:
+        """Whether a call has an answer that the run has not read."""
+        return self.runtime.has_pending
+
+    def answers_ready(self) -> bool:
+        """Whether a call answered since the last step (real clock only: it never waits)."""
+        return self.runtime.wait(0.0).status is WaitStatus.ANSWERS_READY
+
+    def step(self, obs: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+        """Send ``obs``, and again for each answer that became ready. Return the
+        commands of each send and the time of the next step."""
+        self.runtime.start_tick()
+        out = []
+        step = self._run.send(obs)
+        out.append(dict(step.commands))
+        while True:
+            waited = self.runtime.wait(ANSWER_POLL_S)
+            # ``wait`` can report CAN_ADVANCE for a call that finished after its own check.
+            if waited.status is WaitStatus.ANSWERS_READY or (
+                waited.status is WaitStatus.CAN_ADVANCE
+                and self.runtime.take_completed()
+            ):
+                step = self._run.send(obs)
+                out.append(dict(step.commands))
+            elif waited.status is WaitStatus.CAN_ADVANCE:
+                return out, int(step.resume_at_ns)
+
+    def close(self) -> None:
+        """Drain the calls, then close the run and its server session."""
+        self.runtime.close()
+        if self._run is not None:
+            self._run.close()
+            self._run = None
 
 
 # -- robot -----------------------------------------------------------------------
@@ -593,51 +839,27 @@ def interpolate_rows(prev: np.ndarray, row: np.ndarray, sub: int) -> np.ndarray:
     return prev[None] + (row - prev)[None] * k
 
 
-def play_rows(
+def send_row(
     robot: Any,
-    rows: np.ndarray,
     start: np.ndarray,
-    anchor: dict[str, Any],
-    hist: collections.deque,
-    views: list[str],
+    row: np.ndarray,
     sub: int,
     period: float,
+    tick: float,
     dry: bool,
     paced: bool,
-    *,
-    ui: Ui | None = None,
-    stop: Callable[[], bool] | None = None,
-) -> np.ndarray:
-    """Play the 15 Hz ``rows`` of a chunk on the control clock; return the last row.
-
-    Each row gets the ``sub`` commands of :func:`interpolate_rows` from the
-    previous one (``start`` before row 0), one command per ``period`` seconds
-    (``paced``; off with the fake robot). The stack entry of a row is read as
-    the row starts and appended to ``hist`` (row 0's is ``anchor``), so the
-    stack holds one entry per executed 15 Hz row. ``ui`` gets the frames of
-    each entry. ``stop`` is asked before each row: True raises
-    :class:`StopRun` (the stop button of the page).
-
-    A deadline that is already past when a command goes out (a camera or USB
-    stall in ``read_entry``, a GC pause) slips: the next deadline is one
-    ``period`` after now, not after the missed one. The rows that were due
-    during the stall are not sent back to back, so a stall slows the arm
-    down instead of making it catch up (and the entries read after it stay
-    one row period apart).
-    """
-    prev = start
-    tick = time.monotonic()
-    for i, row in enumerate(rows):
-        if stop is not None and stop():
-            raise StopRun
-        hist.append(anchor if i == 0 else read_entry(robot, views, ui))
-        for q in interpolate_rows(prev, row, sub):
-            send(robot, q, dry)
-            tick = max(tick, time.monotonic()) + period
-            if paced:
-                time.sleep(max(0.0, tick - time.monotonic()))
-        prev = row
-    return prev
+) -> float:
+    """Send the ``sub`` commands from ``start`` to the 15 Hz ``row``
+    (:func:`interpolate_rows`), one per ``period`` seconds after ``tick``;
+    return the deadline of the last one. A deadline that already passed slips
+    to one ``period`` after now: a stall slows the arm down, and the commands
+    that were due are not sent back to back."""
+    for q in interpolate_rows(start, row, sub):
+        send(robot, q, dry)
+        tick = max(tick, time.monotonic()) + period
+        if paced:
+            time.sleep(max(0.0, tick - time.monotonic()))
+    return tick
 
 
 def measure_grip(robot: Any) -> tuple[float, float]:
@@ -1430,9 +1652,9 @@ def auth_headers(a: argparse.Namespace) -> dict[str, str]:
     return {}
 
 
-def session_url(a: argparse.Namespace, n_views: int) -> str:
-    """The session URL: the rig parameters and the other session parameters
-    of the server, under the server's own names."""
+def session_query(a: argparse.Namespace, n_views: int) -> str:
+    """The query of the session: the rig parameters and the other session
+    parameters of the server, under the server's own names."""
     q: dict[str, str] = {"views": str(n_views), "prompt": a.prompt}
     for k in SESSION_FLAGS:
         v = getattr(a, k)
@@ -1440,113 +1662,43 @@ def session_url(a: argparse.Namespace, n_views: int) -> str:
             q[k] = json.dumps(v)
     for k, v in json.loads(a.session or "{}").items():
         q[k] = json.dumps(v)
-    return f"{a.url}?{urlencode(q)}"
+    return urlencode(q)
 
 
 class SessionError(Exception):
     """The server refused the session, answered with an error or went silent."""
 
 
-def handshake(ws: Any, stop: Callable[[], bool] | None = None) -> dict:
-    """Wait for the ``ready`` message; ``stop`` (asked twice a second) ends
-    the wait with :class:`StopRun`."""
-    while True:
-        if stop is None:
-            raw = ws.recv()
-        else:
-            try:
-                raw = ws.recv(timeout=0.5)
-            except TimeoutError:
-                if stop():
-                    raise StopRun from None
-                continue
-        m = loads(raw)
-        st = _s(m, "status")
-        st = st.decode() if isinstance(st, bytes) else st
-        if st == "ready":
-            return _s(m, "meta")
-        if st == "error":
-            raise SessionError(f"server refused the session: {_s(m, 'error')}")
-        print(f"[server] {st}: {_s(m, 'message')}", flush=True)
+def _monotonic_ns() -> int:
+    return round(time.monotonic() * 1e9)
 
 
-def recv_reply(ws: Any, timeout: float, stop: Callable[[], bool] | None = None) -> Any:
-    """The answer to a chunk request. No answer in ``timeout`` seconds raises
-    :class:`SessionError`; ``stop`` (asked 4 times a second) raises
-    :class:`StopRun`."""
-    gone = f"no answer in {timeout:.0f} s (connection lost?): holding and stopping"
-    if stop is None:
-        try:
-            return loads(ws.recv(timeout=timeout))
-        except TimeoutError:
-            raise SessionError(gone) from None
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            return loads(ws.recv(timeout=0.25))
-        except TimeoutError:
-            if stop():
-                raise StopRun from None
-            if time.monotonic() >= deadline:
-                raise SessionError(gone) from None
-
-
-def _text(value: object) -> str:
-    return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
-
-
-def play_chunk(
+def show_call(
     a: argparse.Namespace,
-    robot: Any,
-    views: list[str],
-    hist: collections.deque,
-    anchor: dict[str, Any],
-    targets: np.ndarray,
-    last_cmd: np.ndarray | None,
+    call: Call,
     chunk: int,
-    rtt: float,
-    policy_ms: float,
-    detail: str,
     log: Any,
-    record: dict[str, Any],
-    ui: Ui | None = None,
-) -> np.ndarray | None:
-    """Clamp, print, log and play the ``targets`` of chunk ``chunk``.
-
-    ``anchor`` is the entry of the request, ``last_cmd`` the last command of
-    the chunk before (None at the start). ``rtt`` and ``policy_ms`` are the
-    round trip and the model time, ``detail`` the transport's part of the
-    line, ``record`` its keys of the log record. ``ui`` gets the numbers of
-    the chunk and the frames of its entries; its stop and rest requests end
-    the chunk before the next row (:class:`StopRun`). Return the last
-    command of the chunk, or None in a dry run (the arm did not move).
-    """
-    if not np.isfinite(targets).all() or targets.shape[1:] != (6,):
-        raise SessionError(f"bad chunk {targets.shape}")
-    sub = max(1, round(a.control_hz / FPS))
-    period = 1.0 / (FPS * sub)
-    start = anchor["state"] if last_cmd is None else last_cmd
-    safe = clamp_chunk(targets, start, a.max_step_deg, a.max_grip_step)
-    print(f"chunk {chunk}: {len(safe)} rows, rtt {rtt:.0f} ms "
-          f"(policy {policy_ms:.0f} ms), {detail}, stack {len(hist) + 1}, clamped "
-          f"{float(np.abs(safe - targets).max()):.2f}", flush=True)  # fmt: skip
+    ui: Ui | None,
+) -> None:
+    """Print, log and show one answer with rows (``call``), the chunk ``chunk`` of the session."""
+    policy_ms = float(call.served.get("infer_ms", 0.0))
+    print(f"chunk {chunk}: {len(call.rows)} rows, rtt {call.seconds * 1e3:.0f} ms "
+          f"(policy {policy_ms:.0f} ms), stack {call.stack}", flush=True)  # fmt: skip
     if ui is not None:
-        ui.update(phase="dry run" if a.dry_run else "running", rows=len(safe),
-                  rtt_ms=round(rtt), policy_ms=round(policy_ms))  # fmt: skip
+        ui.update(phase="dry run" if a.dry_run else "running", rows=len(call.rows),
+                  rtt_ms=round(call.seconds * 1e3), policy_ms=round(policy_ms),
+                  effective_prompt=call.prompt, chunk=chunk)  # fmt: skip
     if a.dry_run:
-        for i in (0, len(safe) // 2, len(safe) - 1):
+        for i in (0, len(call.rows) // 2, len(call.rows) - 1):
             cols = " ".join(
-                f"{j}={x:7.2f}" for j, x in zip(JOINTS, safe[i], strict=True)
+                f"{j}={x:7.2f}" for j, x in zip(JOINTS, call.rows[i], strict=True)
             )
             print(f"   row {i:2d}: {cols}")
     if log is not None:
-        log.write(json.dumps({"chunk": chunk, "rtt_ms": rtt, "anchor": anchor["state"].tolist(),
-                              "targets": targets.tolist(), "sent": safe.tolist(), **record}) + "\n")  # fmt: skip
+        log.write(json.dumps({"chunk": chunk, "rtt_ms": call.seconds * 1e3,
+                              "anchor": call.anchor.tolist(), "targets": call.rows.tolist(),
+                              "prompt": call.prompt, "served": call.served}) + "\n")  # fmt: skip
         log.flush()
-    prev = play_rows(robot, safe, start, anchor, hist, views, sub, period,
-                     dry=a.dry_run, paced=not a.fake_robot, ui=ui,
-                     stop=None if ui is None else ui.interrupt.is_set)  # fmt: skip
-    return prev if not a.dry_run else None
 
 
 def run_session(
@@ -1556,66 +1708,98 @@ def run_session(
     log: Any,
     ui: Ui | None = None,
 ) -> None:
-    """The session of a praxis serve endpoint (WebSocket): the handshake,
-    then request, play and log chunk after chunk (:func:`play_chunk`). It
-    returns after ``--max-chunks`` chunks. A problem of the server raises
-    :class:`SessionError`; a stop or rest request of the page (``ui``) raises
-    :class:`StopRun`."""
-    from websockets.sync.client import connect
+    """The session of a praxis serve endpoint: Positronic's ``RemotePolicy``
+    with the client stack that the server declares (:mod:`so101_positronic`).
 
+    The loop runs on the 15 Hz row clock. Each row reads one entry (the joints
+    and the fitted frame of each view, :func:`read_entry`) and gives it to the
+    policy. The policy answers the row target of the stack's trajectory player,
+    and the arm gets it in ``sub`` commands at ``--control-hz``, interpolated
+    from the previous target (:func:`interpolate_rows`). A deadline that passed
+    during a stall slips: the next deadline is one period after now, so a
+    stall slows the arm down and the rows that were due are not sent back to
+    back.
+    ``--max-chunks`` ends the session after that many answers with rows. A
+    problem of the server raises :class:`SessionError`; a stop or rest request
+    of the page (``ui``) raises :class:`StopRun`.
+    """
     stop = ui.interrupt.is_set if ui is not None else None
-    prompt = a.prompt
-    last_cmd: np.ndarray | None = None
+    grip = Grip(a.grip_closed, a.grip_open)
+    calls = CallLog()
+    clock = _monotonic_ns
+    policy = make_policy(
+        a.url, session_query(a, len(views)), grip, calls, clock,
+        headers=auth_headers(a) or None, connect_timeout=a.connect_timeout,
+        recv_timeout=a.recv_timeout, jpeg_quality=a.jpeg_quality,
+    )  # fmt: skip
+    run = PolicyRun(policy, clock)
+    sub = max(1, round(a.control_hz / FPS))
+    period = 1.0 / (FPS * sub)
     if ui is not None:
         ui.update(phase="waiting for the server")
     wait = Waiting("waiting for the server (a cold start takes minutes)")
     try:
-        with connect(session_url(a, len(views)), additional_headers=auth_headers(a),
-                     max_size=16 * 1024 * 1024, open_timeout=a.connect_timeout,
-                     close_timeout=5) as ws:  # fmt: skip
-            meta = handshake(ws, stop)
+        try:
+            meta = run.open(stop)
+        except InterruptedError:
+            raise StopRun from None
+        except Exception as e:  # a refused session, a server that never answers
+            raise SessionError(f"server refused the session: {e}") from e
+        finally:
             wait.done()
-            print(f"[server] ready: {_s(meta, 'arm')} ({_s(meta, 'embodiment')}), views "
-                  f"{_s(meta, 'views')}, steps {_s(meta, 'num_steps')}, cfg_video "
-                  f"{_s(meta, 'cfg_video_scale')}, context {_s(meta, 'max_context_chunks')}, "
-                  f"grip {_s(meta, 'grip_range')}", flush=True)  # fmt: skip
-            hist: collections.deque = collections.deque(
-                maxlen=max(0, int(_s(meta, "stack_entries")) - 1)
+        if on_grid := on_grid_offsets(meta):
+            raise SessionError(
+                f"the server declares frame-stack offsets on the row grid ({len(on_grid)} "
+                "of them): this client needs the half-frame offsets of an so101 server "
+                "with RESTRICT_SQUARE['so101'] = (True, True). Redeploy the so101 server."
             )
-            chunk = 0
-            while not a.max_chunks or chunk < a.max_chunks:
-                if stop is not None and stop():
-                    raise StopRun
-                if ui is not None and ui.get_prompt() != prompt:
-                    prompt = ui.get_prompt()
-                    print(f"[client] prompt: {prompt!r}", flush=True)
-                anchor = read_entry(robot, views, ui)
-                req = build_request([*hist, anchor], views, prompt, a.jpeg_quality)
-                if ui is not None:
-                    ui.update(phase="waiting for the chunk", chunk=chunk)
-                t0 = time.monotonic()
-                ws.send(req)
-                rep = recv_reply(ws, a.recv_timeout, stop)
-                rtt = (time.monotonic() - t0) * 1e3
-                err = _s(rep, "error")
-                if err:
-                    raise SessionError(f"server error: {_text(err)}")
-                targets = np.asarray(_s(rep, "actions"), np.float64)
-                timing = _s(rep, "server_timing") or {}
-                used = _s(rep, "effective_prompt")
-                if ui is not None:
-                    ui.update(effective_prompt=_text(used) if used else prompt)
-                record = {"prompt": prompt,
-                          "server_timing": {k.decode() if isinstance(k, bytes) else k: v
-                                            for k, v in dict(timing).items()}}  # fmt: skip
-                last_cmd = play_chunk(
-                    a, robot, views, hist, anchor, targets, last_cmd, chunk, rtt,
-                    float(_s(timing, "policy_ms") or 0),
-                    f"request {len(req) / 1e6:.2f} MB", log, record, ui=ui,
-                )  # fmt: skip
-                chunk += 1
+        print(f"[server] ready: {meta.get('arm')} ({meta.get('embodiment')}), views "
+              f"{meta.get('views')}, schedule {meta.get('schedule', 'chunked')}, steps "
+              f"{meta.get('num_steps')}, cfg_video {meta.get('cfg_video_scale')}, context "
+              f"{meta.get('max_context_chunks')}, grip {meta.get('grip_range')}", flush=True)  # fmt: skip
+        prompt = a.prompt
+        cmd: np.ndarray | None = None  # the last command that went out
+        seen = 0  # the answers with rows so far
+        played = rows = 0  # the rows played of the last answer, and its rows
+        tick = time.monotonic()
+        while True:
+            if stop is not None and stop():
+                raise StopRun
+            if ui is not None and ui.get_prompt() != prompt:
+                prompt = ui.get_prompt()
+                print(f"[client] prompt: {prompt!r}", flush=True)
+            entry = read_entry(robot, views, ui)
+            obs = observation(
+                entry["state"], {v: entry[v] for v in views}, prompt, grip
+            )
+            try:
+                steps, _ = run.step(obs)
+            except Exception as e:  # an error answer, a lost connection, a bad answer
+                text = str(e).removeprefix("Server error: ")
+                raise SessionError(f"server error: {text}") from e
+            for call in calls.since(seen):
+                show_call(a, call, seen, log, ui)
+                seen, played, rows = seen + 1, 0, len(call.rows)
+            if stop is not None and stop():
+                raise StopRun
+            row = None
+            for commands in steps:
+                row = targets(commands, grip) if commands else row
+            if row is not None:
+                start = entry["state"] if cmd is None else cmd
+                safe = clamp_chunk(row[None], start, a.max_step_deg, a.max_grip_step)[0]
+                tick = send_row(robot, start, safe, sub, period, tick, a.dry_run,
+                                paced=not a.fake_robot)  # fmt: skip
+                cmd, played = safe, played + 1
+            else:
+                tick = max(tick, time.monotonic()) + sub * period
+                if not a.fake_robot:
+                    time.sleep(max(0.0, tick - time.monotonic()))
+            if a.max_chunks and seen >= a.max_chunks and played >= rows:
+                return
     finally:
         wait.done()
+        run.close()
 
 
 def hold(robot: Any, dry: bool) -> None:
