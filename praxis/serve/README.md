@@ -231,9 +231,8 @@ The query of the URL holds the session parameters, for example
 `?sample_seed=0&rollout_id=run1`. Without `sample_seed`, each session draws a
 random seed.
 
-The default session is the chunked call (`schedule: chunked` in the shipped
-configs). `schedule=periodic_chunked` serves the chunked schedule over
-Positronic's periodic flow. The client sends
+The shipped DROID and YAM configs serve `schedule=periodic_chunked` by
+default: the chunked schedule over Positronic's periodic flow. The client sends
 one small sample per tick, and the server keeps the history, encodes the
 window as the samples arrive and plans the trunk ahead. The answers equal the
 chunked call's on the same frames and seed; each chunk plays after the
@@ -251,6 +250,21 @@ schedule; a stateless session (`max_context_chunks=0`) or a short
 
 Real-time chunking is opt-in with `schedule=rtc` in the query (see
 "Real-time chunking").
+
+### Clients
+
+These clients run the periodic default:
+
+- [Positronic-Robotics/positronic](https://github.com/Positronic-Robotics/positronic)
+  0.4.4 or later; 0.4.6 is recommended. The periodic components came with
+  [Positronic-Robotics/positronic#1139](https://github.com/Positronic-Robotics/positronic/pull/1139)
+  (`53fd2579`), first released in 0.4.4.
+- A fork or a pinned commit that reports 0.4.3 but contains `53fd2579`, such
+  as the RoboLab client's pin `a25e9e7` (`eval/robolab/README.md`).
+
+Confirm the client version of every robot that uses a deployment before you
+redeploy it from this commit. A deployed server keeps its schedule until it
+is redeployed. A client that can't be upgraded sets `schedule=chunked`.
 
 ## Serve an SO-100 / SO-101 checkpoint
 
@@ -301,9 +315,9 @@ observed-context session of the other rigs, with these rig settings:
 With the chunked schedule, the robot plays each chunk to its end, then asks
 for the next one and waits for the answer. With real-time chunking the robot
 asks while it still runs the current chunk, so it does not stop between
-chunks. It is opt-in: the serve configs default to the chunked schedule
-(`schedule: chunked` in `configs/serve_droid.yaml`, `configs/serve_yam.yaml`
-and `configs/serve_so101.yaml`). A client asks for real-time chunking with
+chunks. It is opt-in: the DROID and YAM configs default to
+`schedule: periodic_chunked` and `configs/serve_so101.yaml` to
+`schedule: chunked`. A client asks for real-time chunking with
 `/api/v1/session?schedule=rtc`, and a deploy turns it on for every session
 with `schedule: rtc` in the `session` block of its config.
 
@@ -332,9 +346,9 @@ A real-time session uses the periodic flow of Positronic
 ([Positronic-Robotics/positronic#1139](https://github.com/Positronic-Robotics/positronic/pull/1139)).
 **The client needs Positronic 0.4.4 or later**, the first release with the
 `periodic` and `inference_schedule` components. An older client refuses the
-handshake of a real-time session ("This client cannot build the client
-stack that the server declares", an unknown local-stack entry); it keeps the
-default chunked schedule.
+handshake of a periodic session ("This client cannot build the client
+stack that the server declares", an unknown local-stack entry), the DROID and
+YAM default included; it asks for the chunked call with `?schedule=chunked`.
 
 - The server declares the recipe
   `stop_on_fault | trajectory_player | periodic(15 Hz) | inference_schedule |
@@ -381,7 +395,7 @@ The session parameters of real-time chunking:
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `schedule` | `chunked` | `periodic_chunked` serves the chunked answers over the periodic flow, `rtc` turns real-time chunking on (both Positronic 0.4.4 or later); `chunked` is the chunked call. |
+| `schedule` | `chunked` (the shipped DROID and YAM configs: `periodic_chunked`) | `periodic_chunked` serves the chunked answers over the periodic flow, `rtc` turns real-time chunking on (both Positronic 0.4.4 or later); `chunked` is the chunked call. |
 | `rtc_stride` | 12 | Rows between two predictions (1 to 20). |
 | `rtc_rebase_decay` | 24 | Rows over which the junction offset goes back to zero (0 keeps it). |
 | `rtc_vel_fade` | 6 | Rows over which the velocity fades from the plan to the model (0 turns it off). |
@@ -407,9 +421,9 @@ action expert. The window rows are samples that arrive before the
 prediction, and no trunk pass reads the actions or the current pose. So the
 server does this work on the samples before the prediction
 (`praxis/serve/precompute.py`). It is on by default (`precompute: on` in
-the serve configs), and it applies to real-time sessions only
-(`schedule=rtc`). The default session is chunked: it does not use the
-precompute, and it is not faster with it. A client turns it off with
+the serve configs), and it applies to the periodic sessions only
+(`periodic_chunked`, the DROID and YAM default, and `rtc`). The chunked call
+does not use the precompute. A client turns it off with
 `?precompute=off`, and a deploy with `precompute: off` in the `session`
 block of its config.
 

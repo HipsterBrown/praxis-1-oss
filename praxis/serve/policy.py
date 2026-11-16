@@ -22,8 +22,9 @@ and adds the session rules of the server:
   to the plan that the robot runs meanwhile (:mod:`praxis.serve.rtc`).
   ``precompute`` (on by default; ``precompute=off`` turns it off) runs the
   window encode and the trunk passes of each prediction on the samples
-  before it (:mod:`praxis.serve.precompute`). It applies to real-time
-  sessions only: a chunked session does not use it.
+  before it (:mod:`praxis.serve.precompute`). It applies to the periodic
+  sessions (``periodic_chunked`` and ``rtc``): the chunked call does not
+  use it.
 
 The server serves the single-arm checkpoint (the ``franka_ee`` wire), the
 bimanual checkpoint (the ``yam_ee2`` wire) and an so101 checkpoint (the

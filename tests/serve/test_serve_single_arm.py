@@ -152,7 +152,7 @@ def test_serve_config_has_the_recipe() -> None:
         "carry_mode": "clean",
         "skip_video_decoder": True,
         "prompt": "",
-        "schedule": "chunked",
+        "schedule": "periodic_chunked",
         "precompute": True,
     }
     for key in ("checkpoint", "vae_weights", "text_encoder"):
@@ -198,9 +198,9 @@ def test_meta_adds_the_variant() -> None:
     }
     assert meta["max_context_chunks"] == 1 and meta["num_evals"] == 2
     assert meta["t_shift"] == 12.5 and meta["cfg_batched"] is False
-    # The serve config's default is the chunked call (no schedule key);
-    # periodic_chunked and real-time chunking are opt-in.
-    assert "schedule" not in meta
+    # The serve config's default is periodic_chunked; schedule=chunked asks for
+    # the chunked call (no schedule key); real-time chunking is opt-in.
+    assert meta["schedule"] == "periodic_chunked"
     meta = _factory(SINGLE_ARM)[0]({"schedule": "chunked"}).meta
     assert "schedule" not in meta
     rtc_meta = _factory(SINGLE_ARM)[0]({"schedule": "rtc"}).meta
@@ -342,9 +342,9 @@ def test_antialiased_canvas_declares_the_fit_serve_stack() -> None:
         "temporal_stack",
         "chunked_schedule",
     ]
-    # The default is that chunked stack; periodic_chunked declares the periodic
-    # recipe, as schedule=rtc does, the restrict in its place.
-    assert factory({}).meta["local_stack"]["seq"] == seq
+    # The default (periodic_chunked) declares the periodic recipe, as
+    # schedule=rtc does, the restrict in its place.
+    assert factory({}).meta["local_stack"]["seq"] != seq
     pch = factory({"schedule": "periodic_chunked"}).meta["local_stack"]["seq"]
     assert [e["name"] for e in pch] == [
         "stop_on_fault",
@@ -395,7 +395,8 @@ def test_factory_serves_the_bimanual_rig() -> None:
         "target_grip.right",
     ]
     assert pipe.sessions[-1]["control_mode"] == "none"
-    assert "schedule" not in meta  # the chunked default
+    assert meta["schedule"] == "periodic_chunked"  # the config default
+    assert "schedule" not in factory({"schedule": "chunked"}).meta
     assert (
         factory({"schedule": "periodic_chunked"}).meta["schedule"] == "periodic_chunked"
     )

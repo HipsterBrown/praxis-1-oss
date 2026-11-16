@@ -603,11 +603,13 @@ The extras of `pyproject.toml`:
 | `thor` | Quack 0.6.5 with CUDA 13 support | SM110 NVFP4 backend and optional CuTe BF16 expert kernels |
 | `dev` | pytest, ruff | the tests |
 
-The policy server serves the chunked call by default (`schedule: chunked`
-in `configs/serve_*.yaml`). `?schedule=periodic_chunked` serves the chunked
-schedule over Positronic's periodic flow, with the answers of the chunked call, and `?schedule=rtc` real-time chunking
-(see "Connect a Positronic client" in `praxis/serve/README.md`). Both need a
-Positronic client with the periodic components (0.4.4 or later). A periodic session (`periodic_chunked` or `rtc`)
+The policy server's DROID and YAM configs serve `schedule: periodic_chunked`
+by default: the chunked schedule over Positronic's periodic flow, with the answers of the chunked call. It needs a
+Positronic client with the periodic components (0.4.4 or later); an older
+client asks for the chunked call with `?schedule=chunked` in the session URL
+(see "Connect a Positronic client" in `praxis/serve/README.md`). The so101
+config keeps `schedule: chunked`. Real-time chunking is opt-in with
+`?schedule=rtc`. A periodic session (`periodic_chunked` or `rtc`)
 precomputes the window encode and the trunk passes of each prediction on
 the samples before it, with the same answer bits (`precompute: on`;
 `?precompute=off` turns it off). The chunked call does not use the

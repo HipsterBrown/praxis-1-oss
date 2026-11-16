@@ -136,9 +136,9 @@ The default `--query` holds the recommended server settings:
 `declare_stop_on_fault=false&record_denoised=false&max_context_chunks=1&t_shift=12.5`.
 A server that accepts no session settings needs `--query ""`.
 
-The query sets no schedule, so the server's default applies (the chunked call in the shipped
-DROID config). `schedule=periodic_chunked` serves the chunked schedule over Positronic's periodic
-flow instead: its answers equal the chunked call's on the same frames and seed. RoboLab pauses
+The query sets no schedule, so the server's default applies: `periodic_chunked` in the shipped
+DROID config, the chunked schedule over Positronic's periodic flow. Its answers equal the chunked
+call's on the same frames and seed; add `schedule=chunked` to the query for the chunked call. RoboLab pauses
 the sim during each policy call and the client runs Positronic's schedule on a virtual clock that
 stands still during a call, so each chunk starts right after the previous one, as with the
 chunked call. The pinned Positronic commit has the periodic components.

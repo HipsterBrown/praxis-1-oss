@@ -45,5 +45,5 @@ session:
   carry_mode: clean               # clean | zeros (no effect on this checkpoint)
   skip_video_decoder: on          # on | off (on skips the video decoder of the last Euler step)
   prompt: ""                      # task string until the robot sends one
-  schedule: chunked               # chunked | periodic_chunked | rtc (periodic_chunked, rtc: positronic 0.4.4+)
+  schedule: periodic_chunked      # periodic_chunked | chunked | rtc (positronic 0.4.4+; older clients: ?schedule=chunked)
   precompute: on                  # on | off (periodic sessions: periodic_chunked, rtc; no effect on schedule=chunked)
