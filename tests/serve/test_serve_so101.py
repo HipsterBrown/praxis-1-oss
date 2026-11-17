@@ -36,7 +36,7 @@ pytest.importorskip("scipy")
 
 import msgpack
 import uvicorn
-from test_serve_precompute import _PlanPolicy
+from test_serve_precompute import _PlanPolicy, _Recorder
 from test_serve_rtc import DELAYS, FPS, SAMPLE_FPS, _drive, _Encoder, _Pipeline
 from websockets.sync.client import connect
 from websockets.sync.connection import Connection
@@ -209,6 +209,7 @@ def _handshake(ws: Connection) -> dict:
 
 def test_the_lerobot_client_session(server: tuple[str, PolicyFactory]) -> None:
     addr, factory = server
+    # The test sends frame stacks, the wire of the chunked call.
     url = _url(
         addr,
         views=2,
@@ -216,6 +217,7 @@ def test_the_lerobot_client_session(server: tuple[str, PolicyFactory]) -> None:
         grip_closed=3.8,
         grip_open=37.3,
         sample_seed=0,
+        schedule="chunked",
     )
     with connect(url, open_timeout=10) as ws:
         meta = _handshake(ws)
@@ -266,7 +268,7 @@ def test_the_lerobot_client_session(server: tuple[str, PolicyFactory]) -> None:
 
 def test_one_view_session(server: tuple[str, PolicyFactory]) -> None:
     addr, factory = server
-    with connect(_url(addr, views=1), open_timeout=10) as ws:
+    with connect(_url(addr, views=1, schedule="chunked"), open_timeout=10) as ws:
         meta = _handshake(ws)
         assert meta["views"] == 1 and meta["view_order"] == ["image.exterior"]
         stack = [e for e in meta["local_stack"]["seq"] if e["name"] == "temporal_stack"]
@@ -284,7 +286,7 @@ def test_a_short_stack_is_a_cold_start_and_a_bad_state_an_error(
     server: tuple[str, PolicyFactory],
 ) -> None:
     addr, factory = server
-    with connect(_url(addr, views=2), open_timeout=10) as ws:
+    with connect(_url(addr, views=2, schedule="chunked"), open_timeout=10) as ws:
         _handshake(ws)
         ws.send(_request(1, 2))
         _recv(ws)
@@ -342,7 +344,9 @@ def test_a_stateless_session_cold_starts_each_call() -> None:
 
 
 def test_a_grip_reading_high_when_closed_serves_targets_in_its_range() -> None:
-    policy = _factory()({"grip_closed": 40.0, "grip_open": 5.0, "sample_seed": 0})
+    policy = _factory()(
+        {"grip_closed": 40.0, "grip_open": 5.0, "sample_seed": 0, "schedule": "chunked"}
+    )
     rows = policy.select_action(so101.warmup_obs(0))
     assert rows is not None
     grip = so101.wire_to_targets(rows)[:, 5]
@@ -377,7 +381,8 @@ def test_serve_config_is_the_so101_preset() -> None:
     session = cfg["session"]
     assert session["max_context_chunks"] == 1 and session["exec_horizon"] == 24
     assert session["skip_video_decoder"] is True and session["prompt"] == ""
-    assert session["schedule"] == "chunked" and session["control_mode"] == "none"
+    assert session["schedule"] == "periodic_chunked"
+    assert session["control_mode"] == "none"
     # The bf16 configs keep the default precision.
     for name in ("serve_droid.yaml", "serve_yam.yaml"):
         other = yaml.safe_load((ROOT / "configs" / name).read_text())
@@ -659,6 +664,68 @@ def test_the_precompute_keeps_the_bits_of_an_so101_real_time_session() -> None:
             so101.wire_to_targets(a), so101.wire_to_targets(b)
         )
     assert "hit" in runs["on"][1] and runs["off"][1] == []
+
+
+def _so101_stack(n: int, ratio: int, views: int = 2, rows: int = 25) -> dict:
+    """The frame stack a chunked (temporal_stack) so101 client sends at sample
+    ``n``: one row every ``ratio`` samples, the current one last, without rows
+    before the first sample."""
+    raws = [
+        ((n - ratio * b) / (FPS * ratio)) * FPS
+        for b in range(rows - 1, -1, -1)
+        if n - ratio * b >= 0
+    ]
+    obs: dict = {"state": np.stack([_state(r) for r in raws])}
+    for v in so101.VIEWS[:views]:
+        obs[so101.VIEW_KEYS[v]] = np.stack([_frame(r) for r in raws])
+    return obs
+
+
+@pytest.mark.parametrize("precompute", ["on", "off"])
+def test_the_so101_default_answers_as_the_chunked_call(precompute: str) -> None:
+    """The shipped config's default (periodic_chunked): every prediction of a
+    session that sets no schedule equals a chunked call fed the stack a
+    temporal_stack client sends at the same sample, bit for bit, with the
+    precompute on (plans used) and off."""
+    cfg = _config()["session"]
+    assert cfg["schedule"] == "periodic_chunked"
+
+    def make() -> PolicyFactory:
+        factory = _rtc_factory(schedule=cfg["schedule"])
+        factory.pipe.policy = _PlanPolicy(SO101)  # ty: ignore[unresolved-attribute]
+        return factory
+
+    policy = make()({"sample_seed": 0, "sample_fps": 15, "precompute": precompute})
+    assert policy.schedule == "periodic_chunked"
+    rec = _Recorder(policy)
+    got, at, _ = _drive(
+        rec.as_policy(), DELAYS[:6], 12.0, sample=_sample, sample_fps=15
+    )
+    assert len(got) == 6
+    chunked = make()({"schedule": "chunked", "sample_seed": 0})
+    want = [chunked.select_action(_so101_stack(n, 1)) for n in at]
+    for a, b in zip(want, got, strict=True):
+        assert a is not None
+        np.testing.assert_array_equal(
+            so101.wire_to_targets(a), so101.wire_to_targets(b)
+        )
+    # The first two predictions have no context chunk to plan; every warm one
+    # uses its plan when the precompute is on, and reports none when it is off.
+    warm = rec.plans[2:]
+    assert warm == (["hit"] if precompute == "on" else [None]) * len(warm)
+
+
+def test_the_shipped_so101_config_declares_the_periodic_recipe() -> None:
+    """The serve config's session (no schedule in the query) declares the
+    periodic recipe; schedule=chunked keeps the chunked call's stack."""
+    policy = _factory()({})
+    meta = policy.meta
+    assert meta["schedule"] == "periodic_chunked" and meta["precompute"] is True
+    names = [e["name"] for e in policy.local_stack["seq"]]
+    assert names[-3:] == ["trajectory_player", "periodic", "inference_schedule"]
+    chunked = _factory()({"schedule": "chunked"})
+    assert "schedule" not in chunked.meta
+    assert [e["name"] for e in chunked.local_stack["seq"]][-1] == "chunked_schedule"
 
 
 # ---------------------------------------------------------------------------

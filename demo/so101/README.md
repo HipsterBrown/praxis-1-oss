@@ -105,8 +105,9 @@ python demo/so101/so101_client.py --url ws://<host>:8000/api/v1/session \
 - Schedule: `--session '{"schedule": "periodic_chunked"}'` runs the chunked
   schedule over the periodic flow (the same actions as `chunked`, a shorter
   round trip: the client sends one frame per row, not the 25-row stack at
-  each call). `rtc` is real-time chunking. Without it the server's default
-  applies (`chunked` in `configs/serve_so101.yaml`).
+  each call). `rtc` is real-time chunking, and `chunked` is the chunked call.
+  Without it the server's default applies (`periodic_chunked` in
+  `configs/serve_so101.yaml`).
 - `--session '{"num_steps": 4, "sample_seed": 0}'` sets other session
   parameters of the server under their own names; `--max-context-chunks` and
   `--exec-horizon` are flags.

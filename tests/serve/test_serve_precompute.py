@@ -402,17 +402,14 @@ def test_a_single_arm_session_serves_the_same_rows() -> None:
 
 
 def test_the_precompute_is_on_by_default_for_real_time_sessions() -> None:
-    """The default is on in SESSION_DEFAULTS and in both serve configs. It
+    """The default is on in SESSION_DEFAULTS and in the three serve configs. It
     applies to a periodic session (rtc, periodic_chunked) with an observed
-    context, and nowhere else. Both configs default to periodic_chunked; the so101
-    config keeps the chunked call."""
+    context, and nowhere else. The three configs default to periodic_chunked."""
     assert SESSION_DEFAULTS["precompute"] is True
-    for name in ("serve_yam.yaml", "serve_droid.yaml"):
+    for name in ("serve_yam.yaml", "serve_droid.yaml", "serve_so101.yaml"):
         cfg = yaml.safe_load((ROOT / "configs" / name).read_text())
         assert cfg["session"]["precompute"] is True, name
         assert cfg["session"]["schedule"] == "periodic_chunked", name
-    so101 = yaml.safe_load((ROOT / "configs" / "serve_so101.yaml").read_text())
-    assert so101["session"]["schedule"] == "chunked"
     factory = _factory()
     rt = factory({"schedule": "rtc"})
     assert rt.precompute and rt.meta["precompute"] is True
