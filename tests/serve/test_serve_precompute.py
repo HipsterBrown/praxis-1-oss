@@ -66,6 +66,7 @@ class _PlanPolicy(_Policy):
         super().__init__(config)
         self.plans: list[int] = []
         self.plan_skips: list[bool] = []
+        self.plan_flags: list[tuple[bool, bool]] = []
         self.finishes = 0
 
     def _actions(self, anchor, cleans, proprio_all, seed: int) -> torch.Tensor:
@@ -98,9 +99,19 @@ class _PlanPolicy(_Policy):
         return None if skip_last_video else torch.zeros(1, 1, 6, 1, 1), actions
 
     def plan_window_joint(
-        self, text, text_uncond, anchor, cleans, seed, settings, skip_last_video=False
+        self,
+        text,
+        text_uncond,
+        anchor,
+        cleans,
+        seed,
+        settings,
+        skip_last_video=False,
+        ctx_cache=True,
+        pair_cfg=False,
     ):
         self.plans.append(int(seed))
+        self.plan_flags.append((bool(ctx_cache), bool(pair_cfg)))
         self.plan_skips.append(bool(skip_last_video))
         return TrunkPlan(
             text=text,
@@ -585,6 +596,28 @@ def test_a_prediction_off_the_row_grid_has_no_plan() -> None:
     _same_rows(want, got, bimanual.SIDES)
     assert rec.plans[3] == "stale"
     assert rec.plans[4:] == ["hit"] * (len(DELAYS) - 4)
+
+
+def test_a_plan_takes_the_context_cache_and_pairing_of_the_session() -> None:
+    """The plan runs with the session's ``ctx_cache`` and ``pair_cfg``, as the
+    call it replaces does: by default both on, and the session's values when it
+    turns them off."""
+    factory = _with_plans(_factory())
+    policy = factory({"schedule": "rtc", "sample_seed": 0})
+    plans = factory.pipe.policy
+    assert isinstance(plans, _PlanPolicy)
+    for n in range(80):
+        _send(policy, n)
+    assert plans.plan_flags and set(plans.plan_flags) == {(True, True)}
+    factory = _with_plans(_factory())
+    policy = factory({"schedule": "rtc", "sample_seed": 0})
+    policy.session.ctx_cache = False
+    policy.session.pair_cfg = False
+    plans = factory.pipe.policy
+    assert isinstance(plans, _PlanPolicy)
+    for n in range(80):
+        _send(policy, n)
+    assert plans.plan_flags and set(plans.plan_flags) == {(False, False)}
 
 
 @pytest.mark.parametrize("cfg_v", [4.0, 1.0])
