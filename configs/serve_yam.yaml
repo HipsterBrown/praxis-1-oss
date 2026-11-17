@@ -47,3 +47,4 @@ session:
   prompt: ""                      # task string until the robot sends one
   schedule: periodic_chunked      # periodic_chunked | chunked | rtc (positronic 0.4.4+; older clients: ?schedule=chunked)
   precompute: on                  # on | off (periodic sessions: periodic_chunked, rtc; no effect on schedule=chunked)
+  declare_ee_frame: on            # on | off (the change_ee_frame entry of the rig's pose frame, first in the client stack; off for a client that changes the frame itself)

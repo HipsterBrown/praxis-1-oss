@@ -266,6 +266,31 @@ Confirm the client version of every robot that uses a deployment before you
 redeploy it from this commit. A deployed server keeps its schedule until it
 is redeployed. A client that can't be upgraded sets `schedule=chunked`.
 
+### End-effector frame
+
+A Positronic client reports each pose at the `gripper` site of its arm. The
+server states the frame of the poses that it reads and commands: a
+`change_ee_frame` entry first in the client stack, and `ee_frames` in the
+handshake meta (`praxis/serve/ee_frames.py`). Positronic 0.4.x gives a server
+that states no frame each pose at the rig's legacy point (its `end_effector`)
+instead; a later Positronic drops that fallback, and then a server that states
+no frame gets no pose
+([Positronic-Robotics/positronic#1073](https://github.com/Positronic-Robotics/positronic/pull/1073),
+merged after the 0.4.6 release).
+
+- The single-arm rig states Positronic's `franka_hand_frame` (the FR3 Franka
+  Hand point) on `robot_state.ee_pose` and `robot_command`.
+- The bimanual rig states `yam_grasp_site_frame` (the i2rt grasp site) on the
+  keys of both arms.
+- The so101 rig sends joint targets and states no frame.
+
+Each frame is the legacy point of its rig, so a Positronic 0.4.1 or later
+client gets the same poses, and the server the same rows, with or without the
+entry (`tests/serve/test_serve_ee_frames.py`). `declare_ee_frame=off` states no
+frame: for a client older than Positronic 0.4.1, which refuses the entry, and
+for a client that changes the frame on its own side (the RoboLab client drops
+the entry, see `eval/robolab/README.md`).
+
 ## Serve an SO-100 / SO-101 checkpoint
 
 An so101 checkpoint (`"embodiment": "so101"`, `praxis/so101.py`; top README,
@@ -405,6 +430,7 @@ The session parameters of real-time chunking:
 | `rtc_reach_max_m` | `auto` | Bimanual rig: reach radius in m, `auto` (0.595 on both arms), `off`, one radius, or `left,right`. The other rigs refuse it. |
 | `sample_fps` | 15 | Samples per second, a whole multiple of the 15 Hz action rate. Above 15 Hz, a prediction off the row grid of the previous one (the client skipped its sample, or a replan) restarts the context, which refills from the frame stack (one context chunk). |
 | `max_in_flight` | 16 | Calls that the client may have in flight (1 to 16). |
+| `declare_ee_frame` | `on` | States the end-effector frame of the rig's poses (see "End-effector frame"). `off` states none. No effect on the so101 rig. |
 | `precompute` | `on` | Runs the window encode and the trunk passes of each prediction on the samples before it (see below). `off` turns it off. Real-time sessions only. |
 
 A real-time session needs `context_mode=observed`, `max_context_chunks`

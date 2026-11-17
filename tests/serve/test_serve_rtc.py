@@ -651,6 +651,7 @@ def test_a_real_time_session_declares_the_periodic_recipe() -> None:
     meta = policy.meta
     names = [e["name"] for e in policy.local_stack["seq"]]
     assert names == [
+        "change_ee_frame",
         "stop_on_fault",
         "trajectory_player",
         "periodic",
@@ -1085,6 +1086,7 @@ def test_a_single_arm_session_declares_the_periodic_recipe() -> None:
     policy = _droid_factory()({"schedule": "rtc"})
     names = [e["name"] for e in policy.local_stack["seq"]]
     assert names == [
+        "change_ee_frame",
         "stop_on_fault",
         "restrict_image_size",
         "trajectory_player",
@@ -1313,6 +1315,7 @@ def test_a_periodic_chunked_session_declares_the_chunked_periodic_recipe() -> No
     policy = _factory()({"schedule": "periodic_chunked"})
     seq = policy.local_stack["seq"]
     assert [e["name"] for e in seq] == [
+        "change_ee_frame",
         "stop_on_fault",
         "trajectory_player",
         "periodic",

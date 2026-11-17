@@ -52,7 +52,7 @@ from praxis import bimanual, robot_io, single_arm, so101
 from praxis.checkpoint import model_variant
 from praxis.pipeline import RIGS, PraxisPipeline, StepResult
 from praxis.sampler import action_substep_grid, check_guidance, sampler_num_evals
-from praxis.serve import params, periodic, precompute, rtc
+from praxis.serve import ee_frames, params, periodic, precompute, rtc
 from praxis.serve.wire import compress_images, image_codecs
 
 logger = logging.getLogger(__name__)
@@ -79,6 +79,10 @@ SESSION_DEFAULTS: dict = {
     "schedule": "chunked",
     "skip_video_decoder": None,
     "precompute": True,
+    # The end-effector frame of the poses (praxis.serve.ee_frames): a
+    # change_ee_frame entry first in the client stack and ee_frames in the
+    # meta, for the rigs that read or command poses.
+    "declare_ee_frame": True,
 }
 SCHEDULES: tuple[str, ...] = ("chunked", "rtc", "periodic_chunked")
 # The session parameters of the real-time schedule.
@@ -368,7 +372,17 @@ class ServedPolicy:
         self.sg_order = int(o.get("sg_order", d["sg_order"]))
         self.max_chunks = o.get("max_chunks_per_episode", d["max_chunks_per_episode"])
         prompt = str(o.get("prompt", d["prompt"]))
-        self.stop_on_fault = bool(o.get("declare_stop_on_fault", True))
+        self.stop_on_fault = (
+            params.parse_on_off(o.get("declare_stop_on_fault")) is not False
+        )
+        # The frame of the poses that the rig reads and commands, first in the
+        # client stack and in the meta (praxis.serve.ee_frames); the so101 rig
+        # speaks joints and states none. declare_ee_frame=off states none, for a
+        # client that changes the frame itself or is older than Positronic 0.4.1.
+        declare = params.parse_on_off(o.get("declare_ee_frame"))
+        if declare is None:
+            declare = bool(d["declare_ee_frame"])
+        self.ee_frame = ee_frames.entry_for(factory.embodiment) if declare else None
         record = o.get("record_denoised")
         self.compile = params.parse_on_off(o.get("compile"))
         # The server returns commands only, never the predicted video, so the
@@ -640,6 +654,11 @@ class ServedPolicy:
             "sample_seed_base": self.seed_base,
             "seed_source": self.seed_source,
             "local_stack": self.local_stack,
+            **(
+                {"ee_frames": frames}
+                if (frames := ee_frames.meta_frames(self.ee_frame)) is not None
+                else {}
+            ),
             "compress_images": compress_images(),
             "image_codecs": image_codecs(),
             **self._rtc_meta(),
@@ -671,14 +690,14 @@ class ServedPolicy:
             restrict_first=f.restrict_first,
             half_frame=f.half_frame,
         )
-        if self.periodic is None:
-            return stack
-        return periodic.client_recipe(
-            stack,
-            fps=f.fps,
-            sample_fps=float(self.periodic.sample_fps),
-            chunked=self.schedule == "periodic_chunked",
-        )
+        if self.periodic is not None:
+            stack = periodic.client_recipe(
+                stack,
+                fps=f.fps,
+                sample_fps=float(self.periodic.sample_fps),
+                chunked=self.schedule == "periodic_chunked",
+            )
+        return ee_frames.prepend(stack, self.ee_frame)
 
     @property
     def protocol_version(self) -> int:

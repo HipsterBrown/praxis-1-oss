@@ -105,13 +105,37 @@ def wire_address(url: str) -> tuple[str, HostPortAddress]:
     )
 
 
+def without_server_frame(meta: dict[str, Any]) -> dict[str, Any]:
+    """The server's handshake ``meta`` without the end-effector frame it states.
+
+    ``EeFrameChange`` puts the pose in the frame the server expects on this side, so a
+    ``change_ee_frame`` entry in the server's client stack would convert it a second
+    time. This drops that entry and the meta's ``ee_frames``: the stack runs as for a
+    server that states no frame, so a server that states one gives the same rows.
+    """
+    stack = meta.get("local_stack")
+    if isinstance(stack, dict) and isinstance(stack.get("seq"), list):
+        seq = [
+            e
+            for e in stack["seq"]
+            if not (isinstance(e, dict) and e.get("name") == "change_ee_frame")
+        ]
+        meta = {**meta, "local_stack": {**stack, "seq": seq}}
+    return {k: v for k, v in meta.items() if k != "ee_frames"}
+
+
 class _CallLoggingSession:
     """An inference session that drops ``_SCHEDULE_FIELDS`` from each request and logs
-    each call (rows answered, round-trip seconds) to ``calls``."""
+    each call (rows answered, round-trip seconds) to ``calls``. Its ``metadata`` drops
+    the server's end-effector frame (``without_server_frame``)."""
 
     def __init__(self, inner: Any, calls: list[tuple[int, float]]):
         self._inner = inner
         self._calls = calls
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return without_server_frame(dict(self._inner.metadata))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)

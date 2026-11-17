@@ -41,7 +41,7 @@ from websockets.sync.connection import Connection
 from praxis.model import SamplerSettings
 from praxis.pipeline import PraxisPipeline, Session
 from praxis.robot_io import NormStats
-from praxis.serve import params, wire
+from praxis.serve import ee_frames, params, wire
 from praxis.serve import server as server_module
 from praxis.serve.policy import PolicyFactory, served_code_version
 from praxis.serve.server import InferenceServer
@@ -503,8 +503,8 @@ def test_param_literals() -> None:
     }
     with pytest.raises(ValueError, match=r"Unknown session params \['bogus'\]"):
         params.parse_session_params({"bogus": "1"})
-    # 38 of every rig and the 3 of the so101 rig (praxis.so101.SESSION_PARAMS).
-    assert len(params.SESSION_PARAMS) == 41
+    # 39 of every rig and the 3 of the so101 rig (praxis.so101.SESSION_PARAMS).
+    assert len(params.SESSION_PARAMS) == 42
 
 
 def test_rollout_ids_and_seeds() -> None:
@@ -562,7 +562,7 @@ META_KEYS = [
     "compile", "skip_video_decoder", "action_steps", "embodiment", "control_mode",
     "action_layout", "wire_commands", "wan_pattern", "chunk_rows", "action_fps", "prompt",
     "prompt_overridable", "pad_start", "prompt_style", "prompt_rewritten",
-    "sample_seed_base", "seed_source", "local_stack", "compress_images",
+    "sample_seed_base", "seed_source", "local_stack", "ee_frames", "compress_images",
     "image_codecs", "rollout_id", "rollout_id_source", "session_overrides",
 ]  # fmt: skip
 
@@ -625,6 +625,7 @@ def test_handshake_meta(server: tuple[str, InferenceServer]) -> None:
         # The rig sends the views at 1024x288. The server makes the tiles.
         "local_stack": {
             "seq": [
+                ee_frames.entry_for("single_arm"),
                 {"name": "stop_on_fault"},
                 {
                     "name": "temporal_stack",
@@ -646,6 +647,7 @@ def test_handshake_meta(server: tuple[str, InferenceServer]) -> None:
                 },
             ]
         },
+        "ee_frames": ee_frames.meta_frames(ee_frames.entry_for("single_arm")),
         "compress_images": True,
         "image_codecs": ["h264", "jpeg"],
         "rollout_id": "ep00",
@@ -839,7 +841,12 @@ def test_stateless_session_drops_the_temporal_stack(
     ws, ready = _open(addr, "/api/v1/session?context_mode=stateless")
     assert ready["meta"]["context_mode"] == "stateless"
     names = [e["name"] for e in ready["meta"]["local_stack"]["seq"]]
-    assert names == ["stop_on_fault", "chunked_schedule", "restrict_image_size"]
+    assert names == [
+        "change_ee_frame",
+        "stop_on_fault",
+        "chunked_schedule",
+        "restrict_image_size",
+    ]
     for k, t in enumerate((1, 22)):
         ws.send(wire.serialise(_droid_obs(t, seed=k)))
         assert len(_recv(ws)["result"]) == 21

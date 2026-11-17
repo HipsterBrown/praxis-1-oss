@@ -46,6 +46,7 @@ SESSION_PARAMS: frozenset[str] = frozenset(
         "prompt",
         "prompt_style",
         "declare_stop_on_fault",
+        "declare_ee_frame",
         "control_mode",
         "record_denoised",
         "compile",
