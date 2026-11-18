@@ -12,8 +12,9 @@
 # The session parameters of the rig: views (1 | 2), grip_closed and grip_open
 # (the follower's gripper.pos at closure 1 / 0; praxis/so101.py has the
 # contract). The client is demo/so101/so101_client.py (LeRobot). The chunked
-# schedule is the default; schedule=rtc serves real-time chunking as on the
-# other rigs (praxis/serve/README.md, "Real-time chunking").
+# schedule over the periodic flow (periodic_chunked) is the default, as on the
+# other rigs; schedule=chunked asks for the chunked call and schedule=rtc for
+# real-time chunking (praxis/serve/README.md, "Real-time chunking").
 #
 # The checkpoint config sets the rest of the variant: the canvas (the fit rule
 # of training: a 640x480 view gives a 288x416 tile), the 6-D joint head and
@@ -54,5 +55,5 @@ session:
   carry_mode: clean
   skip_video_decoder: on          # on | off (on skips the video decoder of the last Euler step)
   prompt: ""                      # the client sends the task (prompt= in the query, or task in each call)
-  schedule: chunked               # chunked | rtc (real-time chunking)
-  precompute: on                  # real-time sessions: the window encode and the trunk passes ahead of the call
+  schedule: periodic_chunked      # periodic_chunked | chunked | rtc (positronic 0.4.4+; older clients: ?schedule=chunked)
+  precompute: on                  # on | off (periodic sessions: periodic_chunked, rtc; no effect on schedule=chunked)

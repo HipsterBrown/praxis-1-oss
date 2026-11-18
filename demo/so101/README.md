@@ -5,12 +5,16 @@
 follower arm through [LeRobot](https://github.com/huggingface/lerobot). The
 server runs elsewhere: `python -m praxis.serve --config configs/serve_so101.yaml`
 on a local GPU (a 5090 serves the routed experts as NVFP4), or the Modal app
-(`praxis/serve/README.md`). The client is one file without a praxis import.
+(`praxis/serve/README.md`). The client has no praxis import. It runs
+[Positronic](https://github.com/Positronic-Robotics/positronic)'s client
+(`RemotePolicy`): the server declares the client
+stack in its handshake and the client builds it, so one client runs each
+schedule of the server (`chunked`, `periodic_chunked`, `rtc`).
 
 ## Install, next to the robot
 
 ```bash
-pip install "lerobot[feetech]" numpy msgpack websockets pillow
+pip install "lerobot[feetech]" "positronic>=0.4.4,<0.5" numpy pillow
 ```
 
 The follower is calibrated with LeRobot (`lerobot-calibrate`) and connects
@@ -18,6 +22,11 @@ with `use_degrees=True`, the LeRobot 0.7 default: joints in degrees, 0 at
 the calibrated mid-range, `gripper.pos` in 0..100.
 
 ## Run
+
+The client needs an so101 server that declares the half-frame stack offsets
+(`RESTRICT_SQUARE["so101"] = (True, True)` in `praxis/serve/policy.py`):
+redeploy the so101 server with them before a hardware check. Against an
+earlier server the session stops at open with a message that says so.
 
 ```bash
 # the follower's gripper.pos fully closed and fully open (torque off, by hand)
@@ -93,6 +102,12 @@ python demo/so101/so101_client.py --url ws://<host>:8000/api/v1/session \
   host.
 - While the client waits for a cold server it prints the elapsed time every
   30 s.
+- Schedule: `--session '{"schedule": "periodic_chunked"}'` runs the chunked
+  schedule over the periodic flow (the same actions as `chunked`, a shorter
+  round trip: the client sends one frame per row, not the 25-row stack at
+  each call). `rtc` is real-time chunking, and `chunked` is the chunked call.
+  Without it the server's default applies (`periodic_chunked` in
+  `configs/serve_so101.yaml`).
 - `--session '{"num_steps": 4, "sample_seed": 0}'` sets other session
   parameters of the server under their own names; `--max-context-chunks` and
   `--exec-horizon` are flags.
@@ -101,5 +116,8 @@ python demo/so101/so101_client.py --url ws://<host>:8000/api/v1/session \
 - `--fake-robot` runs the loop without hardware against an endpoint;
   `--log-jsonl FILE` appends a record per chunk.
 
+`tests/serve/test_so101_client_parity.py` checks that the client sends the
+stacks of the previous client in the chunked schedule and gets the same rows
+in `periodic_chunked`, bit for bit, on one server.
 `tests/serve/test_so101_client.py` and `tests/serve/test_serve_so101.py` run the
 client's helpers and a fake-robot session against the test server.

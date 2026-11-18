@@ -1304,8 +1304,8 @@ def test_the_config_sets_the_skip_video_decoder_default(
 
 @pytest.mark.parametrize("name", ["serve_droid.yaml", "serve_yam.yaml"])
 def test_serve_configs_skip_the_video_decoder(name: str) -> None:
-    """Both serve configs skip the last step's video decoder; ``off`` in the
-    ``session`` block is a known setting and turns it off."""
+    """The DROID and YAM serve configs skip the last step's video decoder;
+    ``off`` in the ``session`` block is a known setting and turns it off."""
     import yaml
 
     cfg = yaml.safe_load((ROOT / "configs" / name).read_text())
