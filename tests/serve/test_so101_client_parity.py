@@ -263,3 +263,130 @@ def test_only_an_so101_server_without_half_frame_offsets_is_refused(
     monkeypatch.setitem(policy.RESTRICT_SQUARE, "so101", (True, False))
     meta = serve._rtc_factory()({"schedule": schedule}).meta
     assert len(new.on_grid_offsets(meta)) == (24 if schedule == "chunked" else 0)
+
+
+class _Camera:
+    """A LeRobot camera: a reader thread with a new frame every ``period_s``,
+    ``read_latest`` (no wait) and ``async_read`` (waits for a new frame and
+    clears ``new_frame_event``, as LeRobot's OpenCV camera does)."""
+
+    def __init__(self, robot: _RealClockRobot, period_s: float) -> None:
+        self.new_frame_event = threading.Event()
+        self.latest_timestamp: float | None = None
+        self.frame: np.ndarray | None = None
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._loop, args=(robot, period_s))
+        self.thread.daemon = True
+        self.thread.start()
+        assert self.new_frame_event.wait(2.0)
+
+    def _loop(self, robot: _RealClockRobot, period_s: float) -> None:
+        while not self.stop.wait(period_s if self.frame is not None else 0.0):
+            self.frame = serve._frame(float(robot.row()), 240, 320)
+            self.latest_timestamp = time.perf_counter()
+            self.new_frame_event.set()
+
+    def read_latest(self, max_age_ms: int = 500) -> np.ndarray:
+        assert self.frame is not None and self.latest_timestamp is not None
+        age_ms = (time.perf_counter() - self.latest_timestamp) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(f"latest frame is too old: {age_ms:.1f} ms")
+        return self.frame
+
+    def async_read(self, timeout_ms: float = 200) -> np.ndarray:
+        if not self.new_frame_event.wait(timeout_ms / 1e3):
+            raise TimeoutError("no new frame")
+        self.new_frame_event.clear()
+        assert self.frame is not None
+        return self.frame
+
+
+class _RealClockRobot(_Replay):
+    """A replay robot on the real clock. ``read_s`` paces each reading (the
+    motor bus and the frame together). With ``camera_s`` it has a LeRobot
+    camera at that period and a motor bus, and ``get_observation`` is the one
+    of LeRobot 0.4.3 and earlier: ``async_read``, which waits for a new frame."""
+
+    def __init__(
+        self, joints: tuple[str, ...], read_s: float = 0.0, camera_s: float = 0.0
+    ) -> None:
+        super().__init__(_Clock(), joints, ["exterior"])
+        self.t0, self.read_s = time.monotonic(), read_s
+        if camera_s:
+            self.bus = self
+            self.cameras = {"exterior": _Camera(self, camera_s)}
+
+    def row(self) -> int:
+        return round((time.monotonic() - self.t0) * 15.0)
+
+    def sync_read(self, name: str, **_: object) -> dict[str, float]:
+        assert name == "Present_Position"
+        return dict(zip(self.joints, map(float, self.q), strict=True))
+
+    def get_observation(self) -> dict:
+        time.sleep(self.read_s)
+        if not hasattr(self, "cameras"):
+            return super().get_observation()
+        obs: dict = {
+            f"{j}.pos": v for j, v in self.sync_read("Present_Position").items()
+        }
+        return {**obs, "exterior": self.cameras["exterior"].async_read()}
+
+    def disconnect(self) -> None:
+        if hasattr(self, "cameras"):
+            self.cameras["exterior"].stop.set()
+
+
+def _drive_real(
+    client: types.ModuleType,
+    addr: str,
+    monkeypatch: pytest.MonkeyPatch,
+    robot: _RealClockRobot,
+    log: Path,
+) -> tuple[int, int]:
+    """``client.main`` on the real clock, ``periodic_chunked``, 3 chunks; return
+    the rows played and the rows answered."""
+    monkeypatch.setattr(client, "make_robot", lambda a, cams: robot)
+    session = json.dumps({"schedule": "periodic_chunked", "sample_seed": 0})
+    client.main(
+        ["--url", f"ws://{addr}/api/v1/session", "--prompt", "Pick up the cube.",
+         "--no-rest-move", "--no-rest-check", "--max-chunks", "3",
+         "--control-hz", "15", "--session", session, "--log-jsonl", str(log)]
+    )  # fmt: skip
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    return len(robot.sent), sum(len(r["targets"]) for r in records)
+
+
+@pytest.mark.parametrize("camera_s", [0.12, 1 / 7.5])
+def test_a_slow_camera_does_not_skip_rows(
+    new: types.ModuleType,
+    server: tuple[str, list[dict]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    camera_s: float,
+) -> None:
+    """A camera that gives a frame every 0.12 s (or at 7.5 Hz) on the 15 Hz
+    rows: the entry takes the latest frame (repeated on the next row) and the
+    joints at once, so the rows answered are played. ``async_read`` waited for
+    each new frame: 42 rows of 69 went out."""
+    robot = _RealClockRobot(new.JOINTS, camera_s=camera_s)
+    played, answered = _drive_real(
+        new, server[0], monkeypatch, robot, tmp_path / "s.jsonl"
+    )
+    assert played >= answered - 2, (played, answered)
+
+
+def test_a_paced_read_keeps_the_row_grid(
+    new: types.ModuleType,
+    server: tuple[str, list[dict]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A reading of 20 ms on each row stays inside the row period: the next
+    deadline is on the grid, not 20 ms after it. A deadline that slipped by
+    the reading made each row 87 ms, and the player skipped 8 rows of 69."""
+    robot = _RealClockRobot(new.JOINTS, read_s=0.02)
+    played, answered = _drive_real(
+        new, server[0], monkeypatch, robot, tmp_path / "s.jsonl"
+    )
+    assert played >= answered - 2, (played, answered)
