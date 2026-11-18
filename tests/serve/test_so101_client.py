@@ -15,6 +15,10 @@ import numpy as np
 import pytest
 
 pytest.importorskip("PIL")
+# The client runs Positronic's client (positronic 0.4.4 or later), which the
+# demo installs next to the robot (demo/so101/README.md) and the package
+# extras do not. Without it these tests skip; with it they run.
+pytest.importorskip("positronic.policy.remote")
 
 CLIENT = Path(__file__).resolve().parents[2] / "demo" / "so101" / "so101_client.py"
 
@@ -27,6 +31,17 @@ def client() -> types.ModuleType:
     sys.modules[spec.name] = module  # dataclasses look their module up by name
     spec.loader.exec_module(module)
     return module
+
+
+def test_positronic_is_new_enough_for_the_client(client: types.ModuleType) -> None:
+    """The skip above covers a missing positronic only. An installed one older
+    than 0.4.4 fails here instead of skipping: the client needs its periodic
+    components."""
+    from importlib.metadata import version
+
+    major, minor, patch = (int(x) for x in version("positronic").split(".")[:3])
+    assert (major, minor, patch) >= (0, 4, 4), version("positronic")
+    assert callable(client.main)
 
 
 def test_the_client_imports_no_praxis(client: types.ModuleType) -> None:

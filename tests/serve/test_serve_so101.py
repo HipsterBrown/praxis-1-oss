@@ -884,7 +884,9 @@ def test_the_lerobot_client_runs_a_fake_robot_against_the_server(
 ) -> None:
     """demo/so101/so101_client.py --fake-robot: the stack grows with the
     executed rows (1, then 22, then 25 entries), the chunks are 21, 24, 24
-    rows, the context depth 0, 1, 1."""
+    rows, the context depth 0, 1, 1. The client needs positronic (see
+    tests/serve/test_so101_client.py)."""
+    pytest.importorskip("positronic.policy.remote")
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
