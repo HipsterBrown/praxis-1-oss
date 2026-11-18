@@ -1719,7 +1719,9 @@ def run_session(
     during a stall slips: the next deadline is one period after now, so a
     stall slows the arm down and the rows that were due are not sent back to
     back.
-    ``--max-chunks`` ends the session after that many answers with rows. A
+    ``--max-chunks`` ends the session after that many answers with rows have
+    played; the answers that arrive after the last counted one are not shown,
+    logged or counted. A
     problem of the server raises :class:`SessionError`; a stop or rest request
     of the page (``ui``) raises :class:`StopRun`.
     """
@@ -1778,6 +1780,13 @@ def run_session(
                 text = str(e).removeprefix("Server error: ")
                 raise SessionError(f"server error: {text}") from e
             for call in calls.since(seen):
+                if a.max_chunks and seen >= a.max_chunks:
+                    # Past the limit: a real-time session keeps answering while
+                    # the last counted answer plays. Those answers do not count
+                    # and do not restart the rows of the last one, so the
+                    # session still ends when that one played out.
+                    seen += 1
+                    continue
                 show_call(a, call, seen, log, ui)
                 seen, played, rows = seen + 1, 0, len(call.rows)
             if stop is not None and stop():

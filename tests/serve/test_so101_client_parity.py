@@ -235,6 +235,21 @@ def test_the_periodic_chunked_client_gets_the_rows_of_the_chunked_call(
 
 
 @pytest.mark.parametrize("schedule", ["chunked", "periodic_chunked", "rtc"])
+def test_max_chunks_ends_the_session_in_every_schedule(
+    new: types.ModuleType,
+    server: tuple[str, list[dict]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    schedule: str,
+) -> None:
+    """``--max-chunks`` ends the session after that many answers, also in a
+    real-time session, which answers again every stride while a chunk plays:
+    those answers must not restart the rows of the last counted one."""
+    _, records = _drive(new, server[0], monkeypatch, schedule, tmp_path / "s.jsonl")
+    assert len(records) == CHUNKS
+
+
+@pytest.mark.parametrize("schedule", ["chunked", "periodic_chunked", "rtc"])
 def test_only_an_so101_server_without_half_frame_offsets_is_refused(
     new: types.ModuleType, monkeypatch: pytest.MonkeyPatch, schedule: str
 ) -> None:
