@@ -385,3 +385,29 @@ def test_a_paced_read_keeps_the_row_grid(
         new, server[0], monkeypatch, tmp_path / "s.jsonl", read_s=0.02
     )
     assert played == answered, (played, answered)
+
+
+def test_a_frozen_camera_ends_the_session(
+    new: types.ModuleType,
+    server: tuple[str, list[dict]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A camera that stops at 2 s: past ``MAX_FRAME_AGE_MS`` the client says so
+    and waits, and after ``FRAME_WAIT_S`` the session ends; no row plays the
+    frozen frame past the bar."""
+    robot = _SlowRobot(_Clock(), new.JOINTS, camera_s=1 / 30)
+    cam = robot.cameras["exterior"]
+    frozen = math.floor(2.0 * 30)
+    latest = cam._latest
+    monkeypatch.setattr(cam, "_latest", lambda: min(latest(), frozen))
+    with pytest.raises(SystemExit, match="a camera sends no frame"):
+        _drive(
+            new, server[0], monkeypatch, "periodic_chunked", tmp_path / "s.jsonl", robot
+        )
+    assert "no frame within 200 ms" in capsys.readouterr().out
+    assert (
+        robot.clock.t - robot.t0
+        < 2.0 + new.MAX_FRAME_AGE_MS / 1e3 + new.FRAME_WAIT_S + 0.5
+    )

@@ -686,23 +686,24 @@ def read_frames(
     A frame never repeats a row silently past ``max_age_ms``: the client says
     so and waits for a newer one (a reader that ended is connected again,
     :func:`revive_cameras`), for :data:`FRAME_WAIT_S`; then the session ends
-    (:class:`SessionError`)."""
-    out: dict[str, tuple[np.ndarray, float | None]] = {}
+    (:class:`SessionError`). A wait reads the whole set again, so a view read
+    before another view's wait is not returned next to newer joints."""
     t0, said = time.monotonic(), False
-    for view, cam in cams.items():
-        while view not in out:
-            try:
+    while True:
+        out: dict[str, tuple[np.ndarray, float | None]] = {}
+        try:
+            for view, cam in cams.items():
                 out[view] = latest_frame(cam, max_age_ms)
-            except (TimeoutError, RuntimeError) as e:
-                if not said:
-                    say(f"[client] camera {view}: no frame within {max_age_ms:.0f} ms "
-                        f"({e}); waiting for a new one")  # fmt: skip
-                    said = True
-                if time.monotonic() - t0 > FRAME_WAIT_S:
-                    raise SessionError(f"a camera sends no frame: {e}") from e
-                if not revive_cameras(robot):
-                    time.sleep(0.05)
-    return out
+            return out
+        except (TimeoutError, RuntimeError) as e:
+            if not said:
+                say(f"[client] camera {view}: no frame within {max_age_ms:.0f} ms "
+                    f"({e}); waiting for a new one")  # fmt: skip
+                said = True
+            if time.monotonic() - t0 > FRAME_WAIT_S:
+                raise SessionError(f"a camera sends no frame: {e}") from e
+            if not revive_cameras(robot):
+                time.sleep(0.05)
 
 
 def read_entry(
@@ -957,10 +958,16 @@ def send_row(
     paced: bool,
 ) -> float:
     """Send the ``sub`` commands from ``start`` to the 15 Hz ``row``
-    (:func:`interpolate_rows`), one per ``period`` seconds after ``tick``;
+    (:func:`interpolate_rows`), one per ``period`` seconds after ``tick``
+    and at least half a ``period`` after the one before;
     return the deadline of the last one (:func:`next_tick`)."""
+    sent: float | None = None
     for q in interpolate_rows(start, row, sub):
+        if paced and sent is not None:
+            # a late first command does not pull the next one in
+            time.sleep(max(0.0, sent + period / 2 - time.monotonic()))
         send(robot, q, dry)
+        sent = time.monotonic()
         tick = next_tick(tick, period)
         if paced:
             time.sleep(max(0.0, tick - time.monotonic()))
@@ -1944,7 +1951,9 @@ def report_schedule(meta: cabc.Mapping[str, Any]) -> dict[str, float]:
     """Print the counts that Positronic's trajectory player keeps in
     the session metadata (``eval.schedule.*``): the rows scheduled, emitted
     and dropped, how late they went out. Warn when more than
-    :data:`DROPPED_WARN` of the rows were dropped. Return the counts."""
+    :data:`DROPPED_WARN` of the rows were dropped and the late p90 is over half
+    a row (rtc also drops the rows an overlapping chunk replaced on time).
+    Return the counts."""
     pre = "eval.schedule."
     stats = {
         k.removeprefix(pre): float(v) for k, v in meta.items() if k.startswith(pre)
@@ -1957,7 +1966,8 @@ def report_schedule(meta: cabc.Mapping[str, Any]) -> dict[str, float]:
         f"played, {dropped:.0f} skipped; late p50 {stats.get('late_p50_ms', 0.0):.0f} "
         f"ms, p90 {stats.get('late_p90_ms', 0.0):.0f} ms, max "
         f"{stats.get('late_max_ms', 0.0):.0f} ms")  # fmt: skip
-    if dropped / planned > DROPPED_WARN:
+    late = stats.get("late_p90_ms", 0.0) > 500 / FPS  # rtc's replaced rows are on time
+    if dropped / planned > DROPPED_WARN and late:
         say(f"WARNING: {dropped / planned:.0%} of the rows were skipped: the loop "
             "falls behind the row clock (a slow camera, USB or CPU)")  # fmt: skip
     return stats
