@@ -22,8 +22,9 @@ and adds the session rules of the server:
   to the plan that the robot runs meanwhile (:mod:`praxis.serve.rtc`).
   ``precompute`` (on by default; ``precompute=off`` turns it off) runs the
   window encode and the trunk passes of each prediction on the samples
-  before it (:mod:`praxis.serve.precompute`). It applies to real-time
-  sessions only: a chunked session does not use it.
+  before it (:mod:`praxis.serve.precompute`). It applies to the periodic
+  sessions (``periodic_chunked`` and ``rtc``): the chunked call does not
+  use it.
 
 The server serves the single-arm checkpoint (the ``franka_ee`` wire), the
 bimanual checkpoint (the ``yam_ee2`` wire) and an so101 checkpoint (the
@@ -79,7 +80,7 @@ SESSION_DEFAULTS: dict = {
     "skip_video_decoder": None,
     "precompute": True,
 }
-SCHEDULES: tuple[str, ...] = ("chunked", "rtc")
+SCHEDULES: tuple[str, ...] = ("chunked", "rtc", "periodic_chunked")
 # The session parameters of the real-time schedule.
 RTC_PARAMS: frozenset[str] = frozenset(
     {
@@ -413,13 +414,13 @@ class ServedPolicy:
             raise ValueError(f"schedule {self.schedule!r} not in {SCHEDULES}")
         if (
             "schedule" not in o
-            and self.schedule == "rtc"
+            and self.schedule in ("rtc", "periodic_chunked")
             and _chunked_only(o, d, context_mode)
         ):
-            # A deploy's config sets schedule: rtc, and the session asks for
-            # settings that only the chunked schedule serves (a debug session):
-            # it gets the chunked schedule. An explicit schedule=rtc is refused
-            # instead.
+            # A deploy's config sets a periodic schedule (rtc, periodic_chunked),
+            # and the session asks for settings that only the chunked call serves
+            # (a debug session, a stateless context): it gets the chunked call.
+            # An explicit periodic schedule is refused instead.
             self.schedule = "chunked"
         self.rtc: rtc.RTCConfig | None = None
         self.periodic: periodic.PeriodicConfig | None = None
@@ -432,6 +433,16 @@ class ServedPolicy:
         )
         if self.schedule == "rtc":
             self.rtc, self.periodic = _rtc_session(factory, o, context_mode)
+        elif self.schedule == "periodic_chunked":
+            # The chunked schedule over the periodic flow: the same answers as a
+            # chunked call, the image work done as the samples arrive.
+            bad = sorted(k for k in rtc_keys if k.startswith("rtc_"))
+            if bad:
+                raise ValueError(
+                    f"{bad} set the real-time junction; schedule=periodic_chunked "
+                    "plays each chunk to its end"
+                )
+            _, self.periodic = _rtc_session(factory, o, context_mode)
         elif rtc_keys:
             raise ValueError(
                 f"{rtc_keys} set the real-time schedule; add schedule=rtc to use them"
@@ -496,9 +507,10 @@ class ServedPolicy:
             cfg_video_scale=self.cfg_video_scale,
             cfg_batched=self.cfg_batched,
         )
-        # The precompute serves the real-time schedule. The default (on)
-        # leaves a chunked session without it, and an explicit precompute=on
-        # on a chunked session is refused above, as the other rtc keys are.
+        # The precompute serves the periodic sessions (rtc, periodic_chunked).
+        # The default (on) leaves a chunked call without it, and an explicit
+        # precompute=on on a chunked call is refused above, as the other rtc
+        # keys are.
         pre = params.parse_on_off(o.get("precompute", d["precompute"]))
         self.precompute = bool(pre) and self.periodic is not None
         self.session = factory.pipe.session(
@@ -539,7 +551,12 @@ class ServedPolicy:
         self._ahead: precompute.NextWindow | None = None
         if self.precompute and self._history is not None:
             # The plans take the session's skip_video_decoder.
-            self._ahead = precompute.NextWindow(self.session, self._history, ratio)
+            self._ahead = precompute.NextWindow(
+                self.session,
+                self._history,
+                ratio,
+                chunked=self.schedule == "periodic_chunked",
+            )
 
     @property
     def history_frames(self) -> int:
@@ -654,7 +671,10 @@ class ServedPolicy:
         if self.periodic is None:
             return stack
         return periodic.client_recipe(
-            stack, fps=f.fps, sample_fps=float(self.periodic.sample_fps)
+            stack,
+            fps=f.fps,
+            sample_fps=float(self.periodic.sample_fps),
+            chunked=self.schedule == "periodic_chunked",
         )
 
     @property
@@ -668,12 +688,12 @@ class ServedPolicy:
         return 1 if self.periodic is None else int(self.periodic.max_in_flight)
 
     def _rtc_meta(self) -> dict[str, object]:
-        """Return the meta keys of a real-time session (none for a chunked one)."""
-        if self.rtc is None or self.periodic is None:
+        """Return the meta keys of a periodic session (none for a chunked call)."""
+        if self.periodic is None:
             return {}
         return {
             "schedule": self.schedule,
-            "rtc": self.rtc.meta(self.factory.fps),
+            **({} if self.rtc is None else {"rtc": self.rtc.meta(self.factory.fps)}),
             "periodic": {
                 "sample_fps": float(self.periodic.sample_fps),
                 "max_in_flight": int(self.periodic.max_in_flight),
@@ -741,14 +761,19 @@ class ServedPolicy:
         previous one is not a whole number of rows restarts the context.
         """
         hist, grid, cfg = self._history, self._grid, self.rtc
-        if hist is None or grid is None or cfg is None:
-            raise RuntimeError("_sample serves a real-time session only")
+        chunked = self.schedule == "periodic_chunked"
+        if hist is None or grid is None or (cfg is None and not chunked):
+            raise RuntimeError("_sample serves a periodic session only")
         self._junction = {}
         index = obs.get(periodic.SAMPLE_INDEX)
         if isinstance(index, bool) or not isinstance(index, int | np.integer):
             raise ValueError(
                 f"a periodic sample needs an integer {periodic.SAMPLE_INDEX} (the "
-                "periodic sampler of the client stamps it)"
+                f"periodic sampler of the client stamps it). This session is "
+                f"schedule={self.schedule}, on the periodic flow: the client must "
+                "run the recipe of the handshake (Positronic 0.4.4 or later). A "
+                "client that sends frame stacks asks for the chunked call with "
+                "schedule=chunked in the session URL."
             )
         index = int(index)
         for call_id, elapsed in self._timings.collect(obs):
@@ -790,14 +815,23 @@ class ServedPolicy:
         call_id = int(call_id) if isinstance(call_id, int | np.integer) else None
         if call_id is not None:
             self._timings.predicted.add(call_id)
-        delay = min(
-            self._delay.update(self._timings.take()),
-            cfg.max_delay_sec(self.factory.fps),
+        durations = self._timings.take()
+        delay = (
+            0.0
+            if cfg is None
+            else min(
+                self._delay.update(durations),
+                cfg.max_delay_sec(self.factory.fps),
+            )
         )
         # The whole rows since the previous prediction: the stack rows from its
         # current frame on. An empty context fills from the stack instead.
         last = self._last_index
         executed = 0 if last is None else (index - last) // grid.ratio
+        if chunked:
+            # The robot held the end of the chunk while the call ran: the rows
+            # it executed are the chunk, as the chunked call appends.
+            executed = min(executed, self.history_frames)
         restart = bool(
             call_obs.get("reset_context") or call_obs.get("__reset_context__")
         )
@@ -828,12 +862,26 @@ class ServedPolicy:
         rows = res.commands
         if self.smoothing in ("savgol", "sg"):
             rows = self._smoothed(res)
-        wire = self._join(rows, obs, delay)
+        if cfg is None:
+            # The rows of the chunk, as the chunked call returns them: the robot
+            # plays them after the previous chunk (no prefix, no junction).
+            self._junction = {}
+            wire = rows if self.exec_horizon is None else rows[: self.exec_horizon]
+            # Protocol v2 forwards every key of a row as a command channel, and
+            # the client's schedule times the rows: no timestamp, as in rtc.
+            wire = rtc.strip_timestamps(wire)
+        else:
+            wire = self._join(rows, obs, delay)
         if ahead is not None:
             self._junction.update(self._plan_timing(ahead, early))
             ahead.drop()
         self._last_index = index
-        grid.predicted(index, cfg.stride, call_id)
+        if cfg is None:
+            # Every chunk starts when its answer is read: the next prediction
+            # waits for this call's duration, as the first one of rtc does.
+            grid.predicted(index, len(wire), call_id, every_answer=True)
+        else:
+            grid.predicted(index, cfg.stride, call_id)
         return wire
 
     def _plan_timing(

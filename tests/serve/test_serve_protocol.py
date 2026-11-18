@@ -1055,7 +1055,14 @@ def test_warmup_runs_each_context_depth() -> None:
     finally:
         executor.shutdown()
     calls = _pipe(factory).policy.calls
-    assert [c["depth"] for c in calls] == [0, 1, 2, 3]
+    # The chunked session over every depth, then depth 0 and 1 per warm prompt
+    # length, then a periodic session (the plan path) at depth 0 and 1.
+    depths = [c["depth"] for c in calls]
+    assert depths[:4] == [0, 1, 2, 3]
+    n_prompts = len(server_module.WARMUP_PROMPT_TOKENS)
+    assert depths[4 : 4 + 2 * n_prompts] == [0, 1] * n_prompts
+    rest = depths[4 + 2 * n_prompts :]
+    assert rest and set(rest) <= {0, 1} and 1 in rest
     assert all(c["settings"].num_steps == 2 for c in calls)
     obs = warmup_obs(0)
     assert list(obs) == ["image.exterior", "image.wrist", "robot_state.ee_pose", "grip"]

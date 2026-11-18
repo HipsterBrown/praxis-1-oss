@@ -66,6 +66,7 @@ class _PlanPolicy(_Policy):
         super().__init__(config)
         self.plans: list[int] = []
         self.plan_skips: list[bool] = []
+        self.plan_flags: list[tuple[bool, bool]] = []
         self.finishes = 0
 
     def _actions(self, anchor, cleans, proprio_all, seed: int) -> torch.Tensor:
@@ -98,9 +99,19 @@ class _PlanPolicy(_Policy):
         return None if skip_last_video else torch.zeros(1, 1, 6, 1, 1), actions
 
     def plan_window_joint(
-        self, text, text_uncond, anchor, cleans, seed, settings, skip_last_video=False
+        self,
+        text,
+        text_uncond,
+        anchor,
+        cleans,
+        seed,
+        settings,
+        skip_last_video=False,
+        ctx_cache=True,
+        pair_cfg=False,
     ):
         self.plans.append(int(seed))
+        self.plan_flags.append((bool(ctx_cache), bool(pair_cfg)))
         self.plan_skips.append(bool(skip_last_video))
         return TrunkPlan(
             text=text,
@@ -392,12 +403,16 @@ def test_a_single_arm_session_serves_the_same_rows() -> None:
 
 def test_the_precompute_is_on_by_default_for_real_time_sessions() -> None:
     """The default is on in SESSION_DEFAULTS and in both serve configs. It
-    applies to a real-time session with an observed context, and nowhere else."""
+    applies to a periodic session (rtc, periodic_chunked) with an observed
+    context, and nowhere else. Both configs default to periodic_chunked; the so101
+    config keeps the chunked call."""
     assert SESSION_DEFAULTS["precompute"] is True
     for name in ("serve_yam.yaml", "serve_droid.yaml"):
         cfg = yaml.safe_load((ROOT / "configs" / name).read_text())
         assert cfg["session"]["precompute"] is True, name
-        assert cfg["session"]["schedule"] == "chunked", name
+        assert cfg["session"]["schedule"] == "periodic_chunked", name
+    so101 = yaml.safe_load((ROOT / "configs" / "serve_so101.yaml").read_text())
+    assert so101["session"]["schedule"] == "chunked"
     factory = _factory()
     rt = factory({"schedule": "rtc"})
     assert rt.precompute and rt.meta["precompute"] is True
@@ -582,3 +597,107 @@ def test_a_prediction_off_the_row_grid_has_no_plan() -> None:
     _same_rows(want, got, bimanual.SIDES)
     assert rec.plans[3] == "stale"
     assert rec.plans[4:] == ["hit"] * (len(DELAYS) - 4)
+
+
+def test_a_plan_takes_the_context_cache_and_pairing_of_the_session() -> None:
+    """The plan runs with the session's ``ctx_cache`` and ``pair_cfg``, as the
+    call it replaces does: by default both on, and the session's values when it
+    turns them off."""
+    factory = _with_plans(_factory())
+    policy = factory({"schedule": "rtc", "sample_seed": 0})
+    plans = factory.pipe.policy
+    assert isinstance(plans, _PlanPolicy)
+    for n in range(80):
+        _send(policy, n)
+    assert plans.plan_flags and set(plans.plan_flags) == {(True, True)}
+    factory = _with_plans(_factory())
+    policy = factory({"schedule": "rtc", "sample_seed": 0})
+    policy.session.ctx_cache = False
+    policy.session.pair_cfg = False
+    plans = factory.pipe.policy
+    assert isinstance(plans, _PlanPolicy)
+    for n in range(80):
+        _send(policy, n)
+    assert plans.plan_flags and set(plans.plan_flags) == {(False, False)}
+
+
+@pytest.mark.parametrize("cfg_v", [4.0, 1.0])
+def test_the_default_with_the_precompute_answers_as_the_chunked_call(
+    cfg_v: float,
+) -> None:
+    """A deploy whose config defaults to periodic_chunked (the shipped DROID and
+    YAM configs), the precompute on and the plans used: every prediction's rows
+    equal the precompute-off session's, which equal the chunked call's
+    (test_serve_rtc)."""
+
+    def make() -> PolicyFactory:
+        f = _factory()
+        f.defaults["schedule"] = "periodic_chunked"
+        return f
+
+    a = _with_plans(make())(
+        {"sample_seed": 0, "cfg_video_scale": cfg_v, "precompute": "off"}
+    )
+    b = _with_plans(make())(
+        {"sample_seed": 0, "cfg_video_scale": cfg_v, "precompute": "on"}
+    )
+    assert a.schedule == b.schedule == "periodic_chunked"
+    rec = _Recorder(b)
+    want, at_a, _ = _drive(a, DELAYS, 14.0, sample_fps=15.0)
+    got, at_b, _ = _drive(rec.as_policy(), DELAYS, 14.0, sample_fps=15.0)
+    assert at_a == at_b and len(got) == len(DELAYS)
+    _same_rows(want, got, bimanual.SIDES)
+    assert "hit" in rec.plans
+
+
+def _temporal_stack_obs(n: int, ratio: int, rows: int = 25) -> dict:
+    """The frame stack a chunked (temporal_stack) client sends at sample ``n``:
+    one row every ``ratio`` samples, the current one last, without rows before
+    the first sample (``pad_start=False``)."""
+    # The raw of sample k is (k / sample_fps) * 15, computed as _drive does it
+    # (the frames hold int(raw), so a float rounding picks the same frame).
+    fps = 15.0 * ratio
+    raws = [
+        ((n - ratio * b) / fps) * 15.0
+        for b in range(rows - 1, -1, -1)
+        if n - ratio * b >= 0
+    ]
+    return _obs(raws)
+
+
+@pytest.mark.parametrize(
+    ("sample_fps", "depth"), [(15.0, 1), (15.0, 3), (30.0, 1), (30.0, 3)]
+)
+def test_periodic_chunked_equals_the_chunked_client(
+    sample_fps: float, depth: int
+) -> None:
+    """A periodic_chunked session (plans on) against a chunked session fed the
+    stack a temporal_stack client sends at the same sample, from raw frame
+    indices (not the stacks the periodic session rebuilt): every prediction is
+    bit-identical. At 30 Hz the chunk-end grid stays on the row phase, so the
+    context never restarts; past depth 1 no plan is made."""
+    ratio = round(sample_fps / 15.0)
+    query = {
+        "schedule": "periodic_chunked",
+        "sample_seed": 0,
+        "sample_fps": sample_fps,
+        "max_context_chunks": depth,
+    }
+    factory = _with_plans(_factory())
+    pch = factory(query)
+    rec = _Recorder(pch)
+    got, at, _ = _drive(rec.as_policy(), DELAYS[:8], 16.0, sample_fps=sample_fps)
+    assert len(got) == 8
+    chunked = _with_plans(_factory())(
+        {"schedule": "chunked", "sample_seed": 0, "max_context_chunks": depth}
+    )
+    want = [chunked.select_action(_temporal_stack_obs(n, ratio)) for n in at]
+    _same_rows(want, got, bimanual.SIDES)
+    assert all(n % ratio == 0 for n in at)
+    warm = rec.plans[2:]
+    if depth == 1:
+        assert warm == ["hit"] * len(warm)
+    else:
+        policy = factory.pipe.policy
+        assert isinstance(policy, _PlanPolicy)
+        assert set(warm) <= {"none"}

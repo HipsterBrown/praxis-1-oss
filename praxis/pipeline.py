@@ -425,6 +425,12 @@ class Session:
             skip_last_video=self.skip_last_video
             if skip_last_video is None
             else bool(skip_last_video),
+            # The call's settings, so that a hit gives the bits of the call.
+            ctx_cache=bool(getattr(self, "ctx_cache", True)),
+            pair_cfg=bool(
+                getattr(self, "pair_cfg", False)
+                and getattr(self, "overlap_expert", True)
+            ),
         )
 
     @torch.no_grad()

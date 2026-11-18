@@ -66,21 +66,15 @@ def _command_to_wire(command: Any, offset_inv: np.ndarray) -> Any:
 
 
 def with_chunked_schedule(query: str) -> str:
-    """``query`` with ``schedule=chunked`` added when it is not empty and sets no
-    ``schedule``.
+    """``query`` as written: the server's default schedule applies.
 
     RoboLab pauses the sim during each policy call, and the client's schedule runs on a
-    virtual clock that stands still during a call, so real-time chunking gains nothing
-    here. A deploy can set real-time chunking as its default; this client keeps the
-    chunked schedule unless the URL asks for another one. An empty query (a server that
-    accepts no session settings) goes as written.
+    virtual clock that stands still during a call (calls are reported as taking no
+    time). With ``periodic_chunked``, the chunked schedule over the periodic flow, the
+    answers equal the chunked call's, and with no call time each chunk starts right after
+    the previous one, as the chunked call does. A query that sets ``schedule`` keeps it.
     """
-    if not query:
-        return query
-    pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
-    if any(k == "schedule" for k, _ in pairs):
-        return query
-    return f"{query}&schedule=chunked"
+    return query
 
 
 def wire_address(url: str) -> tuple[str, HostPortAddress]:
@@ -88,8 +82,7 @@ def wire_address(url: str) -> tuple[str, HostPortAddress]:
 
     Accepted forms: ``host``, ``host:port`` and ``scheme://host[:port][/api/v1/session[/<model_id>]]``,
     each with an optional ``?query``. ``https``/``wss`` use TLS, the port defaults to 443 for
-    TLS and 80 otherwise, and the query reaches the server as written, with
-    ``schedule=chunked`` added when it is not empty and sets no schedule
+    TLS and 80 otherwise, and the query reaches the server as written
     (``with_chunked_schedule``).
     """
     split = urllib.parse.urlsplit(url if "://" in url else f"//{url}")

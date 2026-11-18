@@ -67,10 +67,11 @@ import uvicorn
 import yaml
 from fastapi import FastAPI, WebSocket
 
+from praxis import robot_io
 from praxis.layers import Attention
 from praxis.model import SamplerSettings
 from praxis.pipeline import PraxisPipeline
-from praxis.serve import params
+from praxis.serve import params, periodic
 from praxis.serve.policy import (
     ChunkBudgetExhausted,
     PolicyFactory,
@@ -393,6 +394,21 @@ def warmup(factory: PolicyFactory, executor: ThreadPoolExecutor) -> None:
             obs = warmup_obs(step, embodiment=factory.embodiment, **variant)
             executor.submit(policy.select_action, obs).result()
         policy.close()
+    if factory.hooks.warmup_variants == ({},):
+        # The backbone sequence holds the prompt's tokens, so the attention
+        # kernels compile once per token count. Warm the counts of short task
+        # prompts at depth 0 and 1 (2-step calls), so a robot's first prompt
+        # finds them compiled.
+        # Compile only: the action expert's CUDA graph slots (8) stay for the
+        # shapes of the robot's prompts, captured on their first call.
+        graphs = getattr(factory.pipe, "action_cuda_graphs", None)
+        with graphs.eager() if graphs is not None else contextlib.nullcontext():
+            for tokens in WARMUP_PROMPT_TOKENS:
+                _warm_prompt(factory, executor, tokens)
+        # The plan path of a periodic session (streamed encode, trunk planned
+        # ahead) runs other kernels than the chunked call: warm it too, so the
+        # first robot session does not pay for it.
+        executor.submit(_warm_periodic, factory).result()
     logger.info(
         "warmup: %d depths x %d sessions in %.1f s, GPU memory %s",
         depths,
@@ -400,6 +416,66 @@ def warmup(factory: PolicyFactory, executor: ThreadPoolExecutor) -> None:
         time.monotonic() - t0,
         _gpu_memory() or "n/a",
     )
+
+
+# The prompt token counts the warmup compiles for: the short task sentences of
+# the robot clients ("Put the cup in the bowl" is 6 tokens). Longer prompts
+# compile on first use.
+WARMUP_PROMPT_TOKENS: tuple[int, ...] = tuple(range(2, 25))
+
+
+def _warm_prompt(
+    factory: PolicyFactory, executor: ThreadPoolExecutor, tokens: int
+) -> None:
+    """Run depths 0 and 1 of a chunked session whose prompt has ``tokens`` tokens."""
+    variant = factory.hooks.warmup_variants[0]
+    prompt = " ".join(["the"] * tokens)
+    try:
+        policy = factory(
+            {
+                "schedule": "chunked",
+                "context_mode": "observed",
+                "num_steps": 2,
+                "action_steps": None,
+                "max_context_chunks": 1,
+                "prompt": prompt,
+                **variant,
+            }
+        )
+    except ValueError:
+        return  # a deploy that serves no observed context
+    for step in range(2):
+        obs = warmup_obs(step, embodiment=factory.embodiment, **variant)
+        executor.submit(policy.select_action, obs).result()
+    policy.close()
+
+
+def _warm_periodic(factory: PolicyFactory, samples: int = 90) -> None:
+    """Drive one periodic session (``periodic_chunked``, the plan on) over
+    synthetic samples until it has planned and used a plan once."""
+    try:
+        policy = factory(
+            {"schedule": "periodic_chunked", "num_steps": 2, "max_context_chunks": 1}
+        )
+    except ValueError:
+        return  # a deploy without the observed context serves no periodic session
+    last = None
+    for i in range(samples):
+        stack = warmup_obs(i // robot_io.ACTION_CHUNK, embodiment=factory.embodiment)
+        obs = {k: v[-1] for k, v in stack.items()}
+        obs.update(
+            {
+                periodic.SAMPLE_INDEX: i,
+                periodic.OBS_TIME_NS: round(i / factory.fps * 1e9),
+                periodic.CALL_ID: i,
+                periodic.CALL_TIMINGS: []
+                if last is None
+                else [{periodic.CALL_ID: last, periodic.ELAPSED_SEC: 0.2}],
+            }
+        )
+        if policy.select_action(obs) is not None:
+            last = i
+    policy.close()
 
 
 def _gpu_memory() -> dict[str, int]:

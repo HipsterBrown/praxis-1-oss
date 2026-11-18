@@ -261,20 +261,17 @@ def _cfg_module(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     ("url", "query"),
     [
         ("host:8000", ""),
-        (
-            "wss://h/api/v1/session?max_context_chunks=1",
-            "max_context_chunks=1&schedule=chunked",
-        ),
+        ("wss://h/api/v1/session?max_context_chunks=1", "max_context_chunks=1"),
         ("ws://h:80/api/v1/session?schedule=rtc&x=1", "schedule=rtc&x=1"),
         ("https://h/api/v1/session/m?schedule=chunked", "schedule=chunked"),
     ],
 )
-def test_the_client_asks_for_the_chunked_schedule(
+def test_the_client_sends_its_query_as_written(
     monkeypatch: pytest.MonkeyPatch, url: str, query: str
 ) -> None:
-    """RoboLab pauses the sim during a call, so the client asks for the chunked
-    schedule unless the URL sets one. A deploy can set real-time chunking as its
-    default. An empty query goes as written."""
+    """The query reaches the server as written: without a ``schedule`` the
+    server's default applies (``periodic_chunked`` in the shipped DROID config),
+    and ``schedule=chunked`` still asks for the chunked call."""
     cfg = _cfg_module(monkeypatch)
     _name, address = cfg.wire_address(url)
     assert address[3] == query
@@ -290,7 +287,7 @@ def test_an_empty_query_stays_empty(monkeypatch: pytest.MonkeyPatch, url: str) -
     assert address[3] == ""
 
 
-def test_the_example_query_asks_for_the_chunked_schedule() -> None:
+def test_the_example_query_takes_the_server_default_schedule() -> None:
     tree = ast.parse((STOCK / "example_client.py").read_text())
     query = next(
         ast.literal_eval(node.value)
@@ -298,4 +295,4 @@ def test_the_example_query_asks_for_the_chunked_schedule() -> None:
         if isinstance(node, ast.Assign)
         and any(isinstance(t, ast.Name) and t.id == "QUERY" for t in node.targets)
     )
-    assert "schedule=chunked" in query.split("&")
+    assert not any(p.startswith("schedule=") for p in query.split("&"))

@@ -688,6 +688,8 @@ class PraxisPolicy(nn.Module):
         seed: int,
         settings: SamplerSettings,
         skip_last_video: bool | None = None,
+        ctx_cache: bool = True,
+        pair_cfg: bool = False,
     ) -> TrunkPlan:
         """Run the trunk passes of :meth:`sample_window_joint` ahead of the call.
 
@@ -707,6 +709,12 @@ class PraxisPolicy(nn.Module):
         decoder: the last step moves only the actions, which read only the
         encoder taps. The actions keep their bits, and the plan has no video
         (None).
+
+        ``ctx_cache`` and ``pair_cfg`` are those of :meth:`sample_window_joint`
+        (same defaults, same bits): the encoder computes the context tokens once
+        per guidance branch and later steps reuse them, and the guided and
+        unguided encoder passes run in lockstep. Pass the session's values, so
+        that a hit gives the bits of the call it replaces.
 
         ``settings.cfg_batched`` raises ``ValueError``: the plan runs the
         guided and the unguided passes one after the other.
@@ -741,38 +749,77 @@ class PraxisPolicy(nn.Module):
             skip_last_video = self.skip_last_video
         decode_uncond = float(settings.cfg_video_scale) != 1.0
         act_uncond = float(settings.cfg_scale) != 1.0
+        ctxs: dict[str, dict] | None = (
+            {"cond": {}, "uncond": {}}
+            if ctx_cache and self.supports_context_cache
+            else None
+        )
+        # sample_window_joint pairs the encoder passes on its overlapped path
+        # (guided, on CUDA, with an encoder and a decoder tower).
+        paired = (
+            pair_cfg
+            and guided
+            and dev.type == "cuda"
+            and hasattr(backbone, "encoder")
+            and hasattr(backbone, "decoder")
+        )
         taps: list[ChunkCausalTaps] = []
         taps_uncond: list[ChunkCausalTaps | None] = []
         for step in range(settings.num_steps):
             t_cur, t_next = ts[step], ts[step + 1]
             video = not (skip_last_video and step == settings.num_steps - 1)
-            t_trunk = torch.full((1, kk), t_cur, dtype=md, device=dev)
-            out = backbone.forward_chunk_causal(
-                text_c, anchor_m, clean, xv.to(md), t_trunk, decode=video
-            )
-            if video and out.velocity is None:
-                raise RuntimeError(f"the trunk pass of step {step} gave no video")
-            v = None if out.velocity is None else out.velocity.float()
-            taps.append(out.taps)
-            unc_taps = None
-            if guided and (video or act_uncond):
-                assert text_u is not None
-                t_trunk = torch.full((1, kk), t_cur, dtype=md, device=dev)
-                out_u = backbone.forward_chunk_causal(
+            uncond = guided and (video or act_uncond)
+            if uncond and text_u is None:
+                raise RuntimeError("the unguided pass needs the blank caption")
+            if paired and uncond:
+                v, tc, v_u, tu = self._plan_pair(
+                    backbone,
+                    text_c,
                     text_u,
                     anchor_m,
                     clean,
-                    xv.to(md),
-                    t_trunk,
-                    decode=video and decode_uncond,
+                    xv,
+                    t_cur,
+                    kk,
+                    ctxs,
+                    video,
+                    video and decode_uncond,
                 )
-                if v is not None and out_u.velocity is not None:
-                    v = guidance_combine(
-                        v, out_u.velocity.float(), settings.cfg_video_scale
+            else:
+                v, tc = self._plan_pass(
+                    backbone,
+                    text_c,
+                    anchor_m,
+                    clean,
+                    xv,
+                    t_cur,
+                    kk,
+                    ctxs,
+                    "cond",
+                    video,
+                )
+                v_u, tu = (
+                    self._plan_pass(
+                        backbone,
+                        cast(Tensor, text_u),  # not None: checked above
+                        anchor_m,
+                        clean,
+                        xv,
+                        t_cur,
+                        kk,
+                        ctxs,
+                        "uncond",
+                        video and decode_uncond,
                     )
-                if act_uncond:
-                    unc_taps = out_u.taps
-            taps_uncond.append(unc_taps)
+                    if uncond
+                    else (None, None)
+                )
+            if video and v is None:
+                raise RuntimeError(f"the trunk pass of step {step} gave no video")
+            taps.append(tc)
+            if v is not None and v_u is not None:
+                v = guidance_combine(v, v_u, settings.cfg_video_scale)
+            taps_uncond.append(tu if uncond and act_uncond else None)
             if v is not None:
                 xv = xv + (t_next - t_cur) * v
         # Copies of the inputs that matches() checks: a caller that changes
@@ -787,6 +834,89 @@ class PraxisPolicy(nn.Module):
             taps=taps,
             taps_uncond=taps_uncond,
             video=None if skip_last_video else xv[:, :, d * lat :].contiguous(),
+        )
+
+    def _plan_pass(
+        self,
+        backbone: ChunkCausalBackbone,
+        text_in: Tensor,
+        anchor: Tensor,
+        clean: Tensor | None,
+        xv: Tensor,
+        t_cur: float,
+        kk: int,
+        ctxs: dict[str, dict] | None,
+        branch: str,
+        decode: bool,
+    ) -> tuple[Tensor | None, ChunkCausalTaps]:
+        """One trunk pass of a plan, as ``velocity`` of :meth:`sample_window_joint` runs it."""
+        dev, md = self.device, self.dtype
+        t_trunk = torch.full((1, kk), t_cur, dtype=md, device=dev)
+        out = backbone.forward_chunk_causal(
+            text_in,
+            anchor,
+            clean,
+            xv.to(md),
+            t_trunk,
+            decode=decode,
+            **({"ctx": ctxs[branch]} if ctxs is not None else {}),
+        )
+        return (None if out.velocity is None else out.velocity.float()), out.taps
+
+    def _plan_pair(
+        self,
+        backbone: ChunkCausalBackbone,
+        text_c: Tensor,
+        text_u: Tensor | None,
+        anchor: Tensor,
+        clean: Tensor | None,
+        xv: Tensor,
+        t_cur: float,
+        kk: int,
+        ctxs: dict[str, dict] | None,
+        decode: bool,
+        decode_u: bool,
+    ) -> tuple[Tensor | None, ChunkCausalTaps, Tensor | None, ChunkCausalTaps]:
+        """Both guidance branches of a plan step, as ``velocities_overlapped`` of
+        :meth:`sample_window_joint` runs their trunk passes: the paired encoders,
+        then the decoders (paired under ``PAIR_DEC``)."""
+        if text_u is None:
+            raise RuntimeError("the unguided pass needs the blank caption")
+        dev, md = self.device, self.dtype
+        # The two-tower backbone (checked by the caller: ``paired``).
+        enc, dec = getattr(backbone, "encoder"), getattr(backbone, "decoder")  # noqa: B009
+        t_trunk = torch.full((1, kk), t_cur, dtype=md, device=dev)
+        noised = xv.to(md)
+        (cond_c, taps_c), (cond_u, taps_u) = enc.forward_chunk_causal_pair(
+            [
+                {
+                    "text": text_in,
+                    "anchor": anchor,
+                    "clean": clean,
+                    "noised": noised,
+                    "timesteps": t_trunk,
+                    "ctx": None if ctxs is None else ctxs[branch],
+                }
+                for text_in, branch in ((text_c, "cond"), (text_u, "uncond"))
+            ]
+        )
+        if _layers.PAIR_DEC and decode and decode_u:
+            v_c, v_u = dec.forward_chunk_causal_pair(
+                [
+                    {"noised": noised, "cond": cond, "timesteps": t_trunk}
+                    for cond in (cond_c, cond_u)
+                ]
+            )
+        else:
+            v_c = dec.forward_chunk_causal(noised, cond_c, t_trunk) if decode else None
+            v_u = (
+                dec.forward_chunk_causal(noised, cond_u, t_trunk) if decode_u else None
+            )
+        return (
+            None if v_c is None else v_c.float(),
+            taps_c,
+            None if v_u is None else v_u.float(),
+            taps_u,
         )
 
     @torch.no_grad()

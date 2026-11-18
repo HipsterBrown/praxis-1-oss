@@ -98,12 +98,18 @@ class NextWindow:
         history: SampleHistory,
         ratio: int,
         skip_last_video: bool | None = None,
+        chunked: bool = False,
     ) -> None:
         if session.memo is None:
             raise ValueError("the precompute needs a session opened with precompute")
         self.session = session
         self.history = history
         self.ratio = int(ratio)
+        # The chunked schedule over the periodic flow: the gap to the next
+        # prediction is the chunk plus the call's duration, more than the stack
+        # the history covers, and the call appends only the chunk. So its window
+        # starts a chunk before the prediction, as the chunked call's does.
+        self.chunked = bool(chunked)
         # None plans with the session's skip_last_video, the skip of the call
         # that the plan stands in for (and of its fallback on a miss).
         self.skip_last_video = (
@@ -199,6 +205,13 @@ class NextWindow:
         """Set the window of the next prediction, ``samples`` after the last one."""
         state = self.session.state
         stream = state.stream
+        if self.chunked:
+            samples = min(int(samples), self.ratio * self.history.history_rows)
+            # Past depth 1 the call's window spans the holds between chunks,
+            # which the contiguous history rows do not: no plan would match.
+            if stream.depth_after(samples // self.ratio) > 1:
+                self._skip = True
+                return
         rows = samples // self.ratio
         # A stream that is empty or past its stack refills from the stack of
         # the call, a gap that is not whole rows restarts the context

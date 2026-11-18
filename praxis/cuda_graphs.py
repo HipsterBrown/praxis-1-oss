@@ -8,7 +8,9 @@ The window-joint action expert uses private pools and events across streams.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+from collections.abc import Iterator
 from dataclasses import fields, is_dataclass
 from functools import wraps
 from threading import Lock
@@ -90,10 +92,25 @@ class CudaGraphPool:
         self.allow_streams = allow_streams
         self._completion = None
         self.frozen = False
+        # True: calls run the original function and capture nothing (eager).
+        self.bypass = False
         self._lock = Lock()
         self._execution_stream = None
         self._stages = {}
         self._originals = []
+
+    @contextlib.contextmanager
+    def eager(self) -> Iterator[None]:
+        """Run the wrapped calls eagerly, capturing no graph, for the duration.
+
+        A warmup that only compiles kernels (for example per prompt length)
+        then leaves the graph slots to the shapes of the real calls.
+        """
+        prev, self.bypass = self.bypass, True
+        try:
+            yield
+        finally:
+            self.bypass = prev
 
     def wrap(self, owner, attr, name):
         original = getattr(owner, attr)
@@ -103,6 +120,8 @@ class CudaGraphPool:
 
         @wraps(original)
         def call(*args, **kwargs):
+            if self.bypass:
+                return original(*args, **kwargs)
             if torch.is_grad_enabled():
                 raise RuntimeError(
                     "CUDA Graph inference requires no_grad/inference_mode"

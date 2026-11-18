@@ -861,7 +861,7 @@ def test_a_malformed_call_id_in_the_timings_keeps_the_session() -> None:
 def test_the_real_time_helpers_refuse_a_chunked_session() -> None:
     """``_sample`` and ``_join`` raise, not assert, so the guard holds under ``-O``."""
     policy = _factory()({})
-    with pytest.raises(RuntimeError, match="_sample serves a real-time session"):
+    with pytest.raises(RuntimeError, match="_sample serves a periodic session"):
         policy._sample({per.SAMPLE_INDEX: 0})
     with pytest.raises(RuntimeError, match="_join serves a real-time session"):
         policy._join([], {}, 0.0)
@@ -1300,3 +1300,215 @@ def test_the_prefix_stops_at_the_rows_left_in_a_21_row_chunk() -> None:
     assert [len(r) for r in answers] == [21, 21, 24, 24]
     assert [j["rtc_delay_ms"] for j in junctions[2:]] == [700.0, 700.0]
     assert [j["rtc_prefix_rows"] for j in junctions[2:]] == [21 - 12, 11]
+
+
+# ---------------------------------------------------------------------------
+# The chunked schedule over the periodic flow (schedule=periodic_chunked)
+# ---------------------------------------------------------------------------
+
+
+def test_a_periodic_chunked_session_declares_the_chunked_periodic_recipe() -> None:
+    """Positronic's periodic components, each chunk played after the previous
+    one and cut at the chunk, no plan sent back: protocol v2."""
+    policy = _factory()({"schedule": "periodic_chunked"})
+    seq = policy.local_stack["seq"]
+    assert [e["name"] for e in seq] == [
+        "stop_on_fault",
+        "trajectory_player",
+        "periodic",
+        "inference_schedule",
+        "restrict_image_size",
+    ]
+    player = next(e for e in seq if e["name"] == "trajectory_player")
+    sched = next(e for e in seq if e["name"] == "inference_schedule")
+    assert player["args"]["plan_key"] is None
+    assert sched["args"]["merge"] == {
+        "start": "after_previous",
+        "horizon_sec": 24 / FPS,
+    }
+    assert policy.protocol_version == 2
+    assert policy.meta["schedule"] == "periodic_chunked" and "rtc" not in policy.meta
+
+
+def test_a_periodic_chunked_session_refuses_the_junction_settings() -> None:
+    with pytest.raises(ValueError, match="plays each chunk to its end"):
+        _factory()({"schedule": "periodic_chunked", "rtc_stride": 8})
+
+
+def test_a_periodic_chunked_session_predicts_at_each_chunk_end() -> None:
+    """Each chunk starts when its answer is read: the next prediction is the
+    chunk (21 rows for the cold start, then 24; one sample per row at 15 Hz)
+    plus that call's duration later."""
+    policy = _factory()({"schedule": "periodic_chunked", "sample_seed": 0})
+    delays = [0.30, 0.27, 0.41, 0.33, 0.29, 0.31]
+    answers, at, _ = _drive(policy, delays, 14.0, sample_fps=15)
+    rows = [len(a) for a in answers]
+    assert rows == [21, *[24] * (len(answers) - 1)]
+    want = [r + round(d * 15) for r, d in zip(rows, delays, strict=False)]
+    assert np.diff(at).tolist() == want[: len(at) - 1]
+
+
+@pytest.mark.parametrize("precompute", ["on", "off"])
+def test_a_periodic_chunked_session_answers_as_the_chunked_call(
+    precompute: str,
+) -> None:
+    """The same frames and seed: the rows of each prediction equal the rows of
+    a chunked call on the stack that the periodic session rebuilds."""
+    pch = _factory()(
+        {"schedule": "periodic_chunked", "sample_seed": 0, "precompute": precompute}
+    )
+    stacks: list[dict] = []
+    step0 = pch.session.step
+
+    def step(obs: dict, executed_rows: int | None = None) -> object:
+        stacks.append(dict(obs))
+        return step0(obs, executed_rows=executed_rows)
+
+    pch.session.step = step  # ty: ignore[invalid-assignment]
+    answers, _, _ = _drive(pch, [0.30, 0.27, 0.41, 0.33], 10.0, sample_fps=15)
+    chunked = _factory()({"schedule": "chunked", "sample_seed": 0})
+    for got, stack in zip(answers, stacks, strict=True):
+        want = chunked.select_action(
+            {k: v for k, v in stack.items() if k != "reset_context"}
+        )
+        chans = rtc.channels(bimanual.SIDES)
+        np.testing.assert_array_equal(
+            rtc.rows_to_array(got, chans), rtc.rows_to_array(want, chans)
+        )
+
+
+def _default_factory() -> PolicyFactory:
+    """A deploy whose config defaults to periodic_chunked, as the shipped DROID
+    and YAM configs do."""
+    factory = _factory()
+    factory.defaults["schedule"] = "periodic_chunked"
+    return factory
+
+
+def _rows(rows: list[dict]) -> np.ndarray:
+    return rtc.rows_to_array(rows, rtc.channels(bimanual.SIDES))
+
+
+def _chunked_on_the_same_stacks(
+    seed: int, stacks: list[dict], cfg_v: float | None = None
+) -> list[np.ndarray]:
+    """A chunked session fed the stacks a periodic session rebuilt, in order."""
+    o: dict = {"schedule": "chunked", "sample_seed": seed}
+    if cfg_v is not None:
+        o["cfg_video_scale"] = cfg_v
+    chunked = _factory()(o)
+    out = []
+    for stack in stacks:
+        call = {k: v for k, v in stack.items() if k != "reset_context"}
+        if stack.get("reset_context"):
+            call["reset_context"] = True
+        out.append(_rows(chunked.select_action(call)))
+    return out
+
+
+def _record_stacks(policy: ServedPolicy) -> list[dict]:
+    stacks: list[dict] = []
+    step0 = policy.session.step
+
+    def step(obs: dict, executed_rows: int | None = None) -> object:
+        stacks.append(dict(obs))
+        return step0(obs, executed_rows=executed_rows)
+
+    policy.session.step = step  # ty: ignore[invalid-assignment]
+    return stacks
+
+
+def test_the_config_default_is_periodic_chunked_and_chunked_opts_out() -> None:
+    factory = _default_factory()
+    assert factory({}).schedule == "periodic_chunked"
+    assert factory({}).protocol_version == 2
+    opt_out = factory({"schedule": "chunked"})
+    assert opt_out.schedule == "chunked" and opt_out.protocol_version == 1
+    # Sessions that only the chunked call serves fall back to it under the
+    # default; an explicit periodic_chunked is refused for them.
+    assert factory({"max_context_chunks": 0}).schedule == "chunked"
+    with pytest.raises(ValueError):
+        factory({"schedule": "periodic_chunked", "max_context_chunks": 0})
+
+
+@pytest.mark.parametrize("cfg_v", [4.0, 1.0])
+def test_the_default_answers_as_the_chunked_call(cfg_v: float) -> None:
+    """The default session against an explicit chunked one on the same stacks
+    and seed: every prediction's rows are bit-equal, the first (21-row) chunk
+    included (test_serve_precompute covers the precompute on)."""
+    pol = _default_factory()(
+        {"sample_seed": 3, "cfg_video_scale": cfg_v, "precompute": "off"}
+    )
+    stacks = _record_stacks(pol)
+    answers, _, _ = _drive(pol, [0.30, 0.27, 0.41, 0.33, 0.29], 12.0, sample_fps=15)
+    assert [len(a) for a in answers] == [21, *[24] * (len(answers) - 1)]
+    want = _chunked_on_the_same_stacks(3, stacks, cfg_v)
+    for got, exp in zip(answers, want, strict=True):
+        np.testing.assert_array_equal(_rows(got), exp)
+
+
+def test_the_default_answers_as_the_chunked_call_across_a_reset() -> None:
+    """An episode reset (``reset_context``) mid-session: the next prediction is
+    a cold start (21 rows) in both, and the rows stay bit-equal."""
+    reset_at = 90  # a sample index (15 Hz: one sample per action raw)
+
+    def sample(raw: float) -> dict:
+        obs = _current(_obs([raw]))
+        if round(raw) == reset_at:
+            obs["reset_context"] = True
+        return obs
+
+    pol = _default_factory()({"sample_seed": 5, "precompute": "off"})
+    stacks = _record_stacks(pol)
+    answers, _, _ = _drive(
+        pol, [0.30, 0.27, 0.33, 0.29, 0.31, 0.30], 18.0, sample=sample, sample_fps=15
+    )
+    lengths = [len(a) for a in answers]
+    assert lengths[0] == 21 and lengths.count(21) == 2, lengths
+    assert sum(1 for st in stacks if st.get("reset_context")) == 1
+    want = _chunked_on_the_same_stacks(5, stacks)
+    for got, exp in zip(answers, want, strict=True):
+        np.testing.assert_array_equal(_rows(got), exp)
+
+
+def test_a_reconnect_starts_a_new_context_as_the_chunked_call_does() -> None:
+    """A new session (the client reconnects) starts from an empty history and a
+    cold start, with the same rows as a fresh chunked session."""
+    for _ in range(2):
+        pol = _default_factory()({"sample_seed": 7, "precompute": "off"})
+        stacks = _record_stacks(pol)
+        answers, _, _ = _drive(pol, [0.30, 0.27], 4.0, sample_fps=15)
+        assert len(answers[0]) == 21
+        want = _chunked_on_the_same_stacks(7, stacks)
+        for got, exp in zip(answers, want, strict=True):
+            np.testing.assert_array_equal(_rows(got), exp)
+        pol.close()
+
+
+def test_a_client_that_sends_frame_stacks_is_told_how_to_ask_for_the_chunked_call() -> (
+    None
+):
+    """A client that ignores the periodic recipe of the handshake and sends a
+    frame stack (no sample index) gets an error that names the fix."""
+    policy = _default_factory()({"sample_seed": 0})
+    with pytest.raises(ValueError, match="schedule=chunked in the session URL"):
+        policy.select_action(_obs([float(r) for r in range(25)]))
+
+
+def test_periodic_chunked_rows_carry_only_command_channels() -> None:
+    """Protocol v2 forwards every key of a row to the robot as a command channel,
+    and a stock harness refuses a channel its embodiment does not take: the
+    periodic_chunked rows carry no ``timestamp``, as the rtc rows do. The
+    commands equal the chunked call's rows."""
+    pol = _default_factory()({"sample_seed": 0, "precompute": "off"})
+    stacks = _record_stacks(pol)
+    answers, _, _ = _drive(pol, [0.30, 0.27, 0.33], 7.0, sample_fps=15)
+    rtc_rows, _, _ = _drive(
+        _factory()({"schedule": "rtc", "sample_seed": 0}), [0.30, 0.27], 5.0
+    )
+    channels = {k for row in rtc_rows[0] for k in row}
+    assert "timestamp" not in channels
+    want = _chunked_on_the_same_stacks(0, stacks)
+    for got, exp in zip(answers, want, strict=True):
+        assert {k for row in got for k in row} == channels
+        np.testing.assert_array_equal(_rows(got), exp)

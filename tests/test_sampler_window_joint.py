@@ -966,3 +966,59 @@ def test_a_plan_keeps_what_its_expert_passes_read(
     assert video is not None and want[0] is not None
     assert torch.equal(video, want[0])
     assert torch.equal(actions, want[1])
+
+
+@pytest.mark.parametrize("ctx_cache", [False, True])
+@pytest.mark.parametrize(("cfg", "cfg_v"), [(1.0, 1.0), (1.0, 4.0), (3.0, 4.0)])
+def test_a_plan_with_the_context_cache_gives_the_bits_of_the_sampler(
+    monkeypatch: pytest.MonkeyPatch, ctx_cache: bool, cfg: float, cfg_v: float
+) -> None:
+    """The real (tiny) backbone: a plan made with the sampler's ``ctx_cache``
+    gives the bits of one sampler call with the same setting, at depth 1 (the
+    context the cache reuses) and with guidance."""
+    from tiny_model import TINY_HW, tiny_policy
+    from torch.nn.attention.flex_attention import flex_attention
+
+    import praxis.layers
+
+    monkeypatch.setattr(praxis.layers, "_compiled_flex_attention", flex_attention)
+    policy = tiny_policy()
+    h, w = TINY_HW
+    g = torch.Generator().manual_seed(1)
+    text = torch.randn(1, 5, 32, generator=g).to(MD)
+    unc = torch.randn(1, 1, 32, generator=g).to(MD)
+    anchor = torch.randn(1, C, 1, h, w, generator=g).to(MD)
+    cleans = [torch.randn(1, C, LAT, h, w, generator=g).to(MD)]
+    pro = torch.randn(1, 2, 10, generator=g)
+    settings = SamplerSettings(num_steps=3, cfg_scale=cfg, cfg_video_scale=cfg_v)
+    want = policy.sample_window_joint(
+        text, unc, anchor, cleans, pro, 3, settings, ctx_cache=ctx_cache
+    )
+    plan = policy.plan_window_joint(
+        text, unc, anchor, cleans, 3, settings, ctx_cache=ctx_cache
+    )
+    video, actions = policy.finish_window_joint(plan, pro)
+    assert video is not None and want[0] is not None
+    assert torch.equal(video, want[0])
+    assert torch.equal(actions, want[1])
+
+
+@pytest.mark.parametrize("requested", [False, True])
+def test_a_plan_uses_the_context_cache_as_the_sampler_does(
+    monkeypatch: pytest.MonkeyPatch, requested: bool
+) -> None:
+    """The plan passes a context cache to each trunk pass exactly when the
+    sampler would: on request, and never for NVFP4 experts."""
+    for precision in ("bf16", "nvfp4"):
+        calls = Calls()
+        monkeypatch.setattr(model_mod, "run_expert_on_taps_k", _stub_expert(calls))
+        policy = _policy(calls)
+        if precision == "nvfp4":
+            policy.routed_quantization = {"format": precision}
+        trunk = {k: v for k, v in _inputs(1).items() if k != "proprio_all"}
+        policy.plan_window_joint(
+            seed=5, settings=SamplerSettings(), ctx_cache=requested, **trunk
+        )
+        active = requested and precision == "bf16"
+        assert calls.trunk
+        assert all((call["ctx"] is not None) is active for call in calls.trunk)
