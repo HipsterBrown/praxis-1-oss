@@ -296,3 +296,51 @@ def test_the_example_query_takes_the_server_default_schedule() -> None:
         and any(isinstance(t, ast.Name) and t.id == "QUERY" for t in node.targets)
     )
     assert not any(p.startswith("schedule=") for p in query.split("&"))
+
+
+def test_the_robolab_session_drops_the_server_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EeFrameChange`` converts the pose on the client, so the session hands
+    ``RemotePolicy`` the server's meta without its ``change_ee_frame`` entry and
+    ``ee_frames``: the stack it builds is the one of a server that states no
+    frame, and the pose is converted once."""
+    cfg = _cfg_module(monkeypatch)
+    # The single-arm entry of praxis.serve.ee_frames (this file imports no server).
+    entry = {
+        "name": "change_ee_frame",
+        "version": 2,
+        "args": {
+            "site": "gripper",
+            "transform": [
+                0.0,
+                0.0,
+                -0.0516,
+                0.9238795325112867,
+                0.0,
+                0.0,
+                -0.3826834323650898,
+            ],
+            "keys": ["robot_state.ee_pose", "robot_command.pose", "robot_command"],
+        },
+    }
+    plain = {
+        "local_stack": {
+            "seq": [{"name": "stop_on_fault"}, {"name": "chunked_schedule"}]
+        },
+        "embodiment": "franka_ee",
+    }
+    stated = {
+        **plain,
+        "local_stack": {"seq": [entry, *plain["local_stack"]["seq"]]},
+        "ee_frames": {
+            k: {"site": "gripper", "offset": entry["args"]["transform"]}
+            for k in entry["args"]["keys"]
+        },
+    }
+    inner = types.SimpleNamespace(metadata=stated, protocol_version=1)
+    session = cfg._CallLoggingSession(inner, [])
+    assert session.metadata == plain
+    assert session.protocol_version == 1
+    assert inner.metadata == stated  # the server's own meta is not changed
+    assert cfg.without_server_frame(plain) == plain

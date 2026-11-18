@@ -154,6 +154,7 @@ def test_serve_config_has_the_recipe() -> None:
         "prompt": "",
         "schedule": "periodic_chunked",
         "precompute": True,
+        "declare_ee_frame": True,
     }
     for key in ("checkpoint", "vae_weights", "text_encoder"):
         assert not Path(cfg["model"][key]).is_absolute(), key
@@ -337,6 +338,7 @@ def test_antialiased_canvas_declares_the_fit_serve_stack() -> None:
     assert factory.restrict == (416, 234) and factory.restrict_first is True
     seq = factory({"schedule": "chunked"}).meta["local_stack"]["seq"]
     assert [e["name"] for e in seq] == [
+        "change_ee_frame",
         "stop_on_fault",
         "restrict_image_size",
         "temporal_stack",
@@ -347,6 +349,7 @@ def test_antialiased_canvas_declares_the_fit_serve_stack() -> None:
     assert factory({}).meta["local_stack"]["seq"] != seq
     pch = factory({"schedule": "periodic_chunked"}).meta["local_stack"]["seq"]
     assert [e["name"] for e in pch] == [
+        "change_ee_frame",
         "stop_on_fault",
         "restrict_image_size",
         "trajectory_player",
@@ -355,14 +358,16 @@ def test_antialiased_canvas_declares_the_fit_serve_stack() -> None:
     ]
     rtc_seq = factory({"schedule": "rtc"}).meta["local_stack"]["seq"]
     assert [e["name"] for e in rtc_seq] == [
+        "change_ee_frame",
         "stop_on_fault",
         "restrict_image_size",
         "trajectory_player",
         "periodic",
         "inference_schedule",
     ]
-    assert seq[1]["args"] == {"width": 416, "height": 234}
-    offsets = seq[2]["args"]["offsets_sec"]
+    by_name = {e["name"]: e for e in seq}
+    assert by_name["restrict_image_size"]["args"] == {"width": 416, "height": 234}
+    offsets = by_name["temporal_stack"]["args"]["offsets_sec"]
     assert len(offsets) == 25 and offsets[-1] == 0.0
     assert offsets[0] == -24 / 15 + 0.5 / 15 and offsets[-2] == -1 / 15 + 0.5 / 15
 
@@ -404,12 +409,13 @@ def test_factory_serves_the_bimanual_rig() -> None:
     seq = factory({"schedule": "chunked"}).meta["local_stack"]["seq"]
     # The YAM client order: the stack, then the restrict; half-frame offsets.
     assert [s["name"] for s in seq] == [
+        "change_ee_frame",
         "stop_on_fault",
         "temporal_stack",
         "chunked_schedule",
         "restrict_image_size",
     ]
-    offsets = seq[1]["args"]["offsets_sec"]
+    offsets = {s["name"]: s for s in seq}["temporal_stack"]["args"]["offsets_sec"]
     assert offsets[-1] == 0.0 and abs(offsets[0] + 23.5 / 15) < 1e-9
     with pytest.raises(ValueError, match="control_mode"):
         factory({"control_mode": "droid_impedance"})

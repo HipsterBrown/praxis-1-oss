@@ -25,7 +25,9 @@ The client differs from a stock Positronic setup in a few places:
   policy states its own frame (Positronic's `ChangeEEFrame`). This client keeps the
   pose in RoboLab's `eef_frame` and applies a measured constant frame change in front
   of `RemotePolicy` (`positronic_cfg/ee_frame_policy_cfg.py`), so the server gets the
-  pose in the frame it expects without declaring a frame change of its own.
+  pose in the frame it expects without declaring a frame change of its own. The
+  server states its own frame (`change_ee_frame`, `praxis/serve/README.md`), and the
+  client drops that entry from the server's meta, so the pose changes frame once.
 - The client drops `call_id` and `call_timings`, which the Positronic schedule adds
   to each request, and leaves out `robot_state.status`. The server reads none of them.
 - The client records no `ee_frames` entry in the episode metadata (nothing in the
