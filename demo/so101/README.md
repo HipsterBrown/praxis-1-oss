@@ -14,7 +14,7 @@ schedule of the server (`chunked`, `periodic_chunked`, `rtc`).
 ## Install, next to the robot
 
 ```bash
-pip install "lerobot[feetech]" "positronic>=0.4.4,<0.5" numpy pillow
+pip install "lerobot[feetech]>=0.5" "positronic>=0.4.4,<0.5" numpy pillow
 ```
 
 The follower is calibrated with LeRobot (`lerobot-calibrate`) and connects

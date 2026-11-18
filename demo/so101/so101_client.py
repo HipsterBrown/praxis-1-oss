@@ -8,7 +8,7 @@ It has no praxis import. It runs Positronic's client (``RemotePolicy``,
 the section "the Positronic client" below): the server declares the client stack in its
 handshake and the client builds it, so the client runs each schedule of the
 server (``chunked``, ``periodic_chunked``, ``rtc``). Next to the robot it
-needs ``lerobot`` (with the Feetech extra), ``positronic`` 0.4.4 or later,
+needs ``lerobot`` 0.5 or later (with the Feetech extra), ``positronic`` 0.4.4 or later,
 ``numpy`` and ``Pillow``.
 
     python demo/so101/so101_client.py \\
@@ -46,9 +46,12 @@ Command contract (what the client plays): the rows of each answer, absolute
 targets in the units of the readings, one row per 1/15 s (21 rows on the
 first chunk of a context, 24 after), as the stack's trajectory player times
 them. ``--control-hz`` (30 by default, the LeRobot control rate) sends the
-arm a linear interpolation between the 15 Hz rows. A deadline that passed
-during a stall (a camera read, a GC pause) slips: the client slows down, it
-never sends the overdue rows back to back. Safety is LeRobot's:
+arm a linear interpolation between the 15 Hz rows. The rows keep the time grid
+of the policy (``periodic_chunked`` and ``rtc`` plan on it): after a stall (a
+GC pause, a frozen camera) the player skips the rows whose time passed and the
+arm goes to the row that is due, and the control ticks of a row never go out
+back to back. The session logs the rows it skipped (``schedule`` below).
+Safety is LeRobot's:
 ``--max-relative-target`` (the follower's ``max_relative_target``, LeRobot's
 own cap per command); ``--max-step-deg`` / ``--max-grip-step`` add a per-row
 clamp of the client (off by default).
@@ -134,6 +137,11 @@ REST_POSE_DEG = {"shoulder_lift": -100.0, "elbow_flex": 95.0}
 REST_TOL_DEG = 25.0
 #: Seconds to wait for a camera frame that is late before the session ends.
 FRAME_WAIT_S = 6.0
+#: The oldest camera frame (ms) an entry takes, next to joints read at once:
+#: three rows, one period of a camera that slows to 7.5 Hz in low light.
+MAX_FRAME_AGE_MS = 200
+#: The share of skipped rows above which the end of a session warns.
+DROPPED_WARN = 0.1
 # The five joints of that rest pose, the target of the rest moves (the
 # gripper rests at --grip-closed).
 REST_JOINTS_DEG = (0.0, -100.0, 95.0, 70.0, 0.0)
@@ -527,7 +535,8 @@ def camera_configs(a: argparse.Namespace, cams: dict[str, str]) -> dict:
     ``--exterior-cam`` / ``--wrist-cam`` name a camera of ``--cameras`` (the
     ``--robot.cameras`` dict of LeRobot: ``{name: {type, index_or_path,
     width, height, fps}}``), or give an OpenCV index or a device path for an
-    OpenCV camera at ``--cam-width`` x ``--cam-height``, ``--cam-fps``.
+    OpenCV camera at ``--cam-width`` x ``--cam-height``, ``--cam-fps`` and
+    ``--cam-fourcc``.
     """
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 
@@ -553,6 +562,7 @@ def camera_configs(a: argparse.Namespace, cams: dict[str, str]) -> dict:
                 fps=a.cam_fps,
                 width=a.cam_width,
                 height=a.cam_height,
+                fourcc=a.cam_fourcc or None,
             )
     return out
 
@@ -633,15 +643,100 @@ def read_observation(robot: Any) -> dict[str, Any]:
                 time.sleep(0.05)
 
 
-def read_entry(robot: Any, views: list[str], ui: Ui | None = None) -> dict[str, Any]:
+def lerobot_cameras(robot: Any, views: list[str]) -> dict[str, Any] | None:
+    """The LeRobot camera of each view, or None for a robot without them
+    (``--fake-robot``, the replays of the tests)."""
+    cams = getattr(robot, "cameras", None)
+    if not isinstance(cams, dict) or not all(v in cams for v in views):
+        return None
+    return {v: cams[v] for v in views}
+
+
+def check_cameras(robot: Any, views: list[str]) -> None:
+    """Exit unless each camera has ``read_latest`` (LeRobot 0.4.4 or later).
+    Earlier LeRobot only has ``async_read``, which waits for a new frame."""
+    old = [v for v, c in (lerobot_cameras(robot, views) or {}).items()
+           if not callable(getattr(c, "read_latest", None))]  # fmt: skip
+    if old:
+        sys.exit(f"camera {', '.join(old)}: no read_latest (LeRobot before 0.4.4); "
+                 "install a recent LeRobot: pip install -U 'lerobot[feetech]>=0.5'")  # fmt: skip
+
+
+def latest_frame(cam: Any, max_age_ms: float) -> tuple[np.ndarray, float | None]:
+    """The newest frame of LeRobot's reader thread and its age in ms (None if
+    the camera keeps no capture time).
+
+    ``read_latest`` returns at once and leaves ``new_frame_event`` alone, so a
+    slow camera never holds the row up and the page's reader takes no frame of
+    the loop; ``async_read`` would wait for a new frame and clear the event
+    (``read`` too, for up to 10 s). Raises ``TimeoutError`` past ``max_age_ms``.
+    The age is measured from the capture time seen before the read: an upper
+    bound."""
+    stamp = getattr(cam, "latest_timestamp", None)
+    frame = cam.read_latest(max_age_ms=int(max_age_ms))
+    age = None if stamp is None else (time.perf_counter() - stamp) * 1e3
+    return np.asarray(frame, np.uint8), age
+
+
+def read_frames(
+    robot: Any, cams: dict[str, Any], max_age_ms: float
+) -> dict[str, tuple[np.ndarray, float | None]]:
+    """The latest frame of each camera and its age (:func:`latest_frame`).
+
+    A frame never repeats a row silently past ``max_age_ms``: the client says
+    so and waits for a newer one (a reader that ended is connected again,
+    :func:`revive_cameras`), for :data:`FRAME_WAIT_S`; then the session ends
+    (:class:`SessionError`). A wait reads the whole set again, so a view read
+    before another view's wait is not returned next to newer joints."""
+    t0, said = time.monotonic(), False
+    while True:
+        out: dict[str, tuple[np.ndarray, float | None]] = {}
+        try:
+            for view, cam in cams.items():
+                out[view] = latest_frame(cam, max_age_ms)
+            return out
+        except (TimeoutError, RuntimeError) as e:
+            if not said:
+                say(f"[client] camera {view}: no frame within {max_age_ms:.0f} ms "
+                    f"({e}); waiting for a new one")  # fmt: skip
+                said = True
+            if time.monotonic() - t0 > FRAME_WAIT_S:
+                raise SessionError(f"a camera sends no frame: {e}") from e
+            if not revive_cameras(robot):
+                time.sleep(0.05)
+
+
+def read_entry(
+    robot: Any,
+    views: list[str],
+    ui: Ui | None = None,
+    max_age_ms: float = MAX_FRAME_AGE_MS,
+) -> dict[str, Any]:
     """One stack entry: the joint readings and the fitted frame of each view.
-    ``ui`` gets the frames and the readings for the page."""
-    obs = read_observation(robot) if views else read_joints(robot)
+    ``ui`` gets the frames and the readings for the page.
+
+    A LeRobot robot gives the newest frame of each camera's reader thread
+    (:func:`read_frames`), then the joints from the motor bus: no read waits
+    for a camera. A camera slower than the 15 Hz rows repeats its frame on the
+    next row; ``frame_age_ms`` (per view) says how old each frame was. The
+    entry has no capture time: the periodic sampler stamps its own sample
+    time, which the server's stack and the rtc offsets use."""
+    cams = lerobot_cameras(robot, views) if views else None
+    ages: dict[str, float | None] = {}
+    if cams is not None and hasattr(getattr(robot, "bus", None), "sync_read"):
+        frames = read_frames(robot, cams, max_age_ms)
+        obs: dict[str, Any] = {**read_joints(robot)}
+        for v, (frame, age) in frames.items():
+            obs[v], ages[v] = frame, age
+    else:
+        obs = read_observation(robot) if views else read_joints(robot)
     e: dict[str, Any] = {"state": np.array([float(obs[f"{j}.pos"]) for j in JOINTS])}
     for v in views:
         e[v] = fit_frame(np.asarray(obs[v], np.uint8))
         if ui is not None:
             ui.publish(v, e[v])
+    if views:
+        e["frame_age_ms"] = ages
     if ui is not None:
         ui.update(state=[round(float(x), 1) for x in e["state"]])
     return e
@@ -839,6 +934,19 @@ def interpolate_rows(prev: np.ndarray, row: np.ndarray, sub: int) -> np.ndarray:
     return prev[None] + (row - prev)[None] * k
 
 
+def next_tick(tick: float, period: float) -> float:
+    """The deadline ``period`` after ``tick``, on the grid of ``tick``.
+
+    The time a row takes before its command (the read of the entry, the
+    step) stays inside the period: slipping the deadline by it would make
+    each row a period plus that time, and the time-based player of the
+    policy would then skip a row every few. A deadline that passed by a
+    whole period or more (a stall) slips to one ``period`` after now, so the
+    commands that were due are not sent back to back."""
+    now = time.monotonic()
+    return (tick if now - tick < period else now) + period
+
+
 def send_row(
     robot: Any,
     start: np.ndarray,
@@ -850,13 +958,17 @@ def send_row(
     paced: bool,
 ) -> float:
     """Send the ``sub`` commands from ``start`` to the 15 Hz ``row``
-    (:func:`interpolate_rows`), one per ``period`` seconds after ``tick``;
-    return the deadline of the last one. A deadline that already passed slips
-    to one ``period`` after now: a stall slows the arm down, and the commands
-    that were due are not sent back to back."""
+    (:func:`interpolate_rows`), one per ``period`` seconds after ``tick``
+    and at least half a ``period`` after the one before;
+    return the deadline of the last one (:func:`next_tick`)."""
+    sent: float | None = None
     for q in interpolate_rows(start, row, sub):
+        if paced and sent is not None:
+            # a late first command does not pull the next one in
+            time.sleep(max(0.0, sent + period / 2 - time.monotonic()))
         send(robot, q, dry)
-        tick = max(tick, time.monotonic()) + period
+        sent = time.monotonic()
+        tick = next_tick(tick, period)
         if paced:
             time.sleep(max(0.0, tick - time.monotonic()))
     return tick
@@ -1370,15 +1482,15 @@ class Ui:
 
         LeRobot cameras read in their own thread, so this does not touch the
         motor bus. A robot without cameras (``--fake-robot``) is left alone.
+        Only ``read_latest``: ``async_read`` clears the camera's
+        ``new_frame_event``, so it would take the frames of the session loop,
+        which then waits a camera period for the next one.
         """
         cams = getattr(robot, "cameras", None)
         if not isinstance(cams, dict):
             return
         readers = {
-            v: getattr(cams[v], "read_latest", None)
-            or getattr(cams[v], "async_read", None)
-            for v in self.views
-            if v in cams
+            v: getattr(cams[v], "read_latest", None) for v in self.views if v in cams
         }
 
         revived = [0.0]  # the time of the last try to connect a camera again
@@ -1580,6 +1692,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--cam-width", type=int, default=640)
     ap.add_argument("--cam-height", type=int, default=480)
     ap.add_argument("--cam-fps", type=int, default=30)
+    ap.add_argument("--cam-fourcc", default=None,
+                    help="pixel format of the OpenCV cameras (default: the camera's); "
+                         "MJPG for two 640x480@30 cameras on one USB bus, where YUYV "
+                         "runs out of bandwidth")  # fmt: skip
     ap.add_argument("--prompt", default=None, help="the task (required to run)")
     ap.add_argument("--grip-closed", type=float, default=DEFAULT_GRIP_CLOSED,
                     help="this follower's gripper.pos fully closed (--measure-grip)")  # fmt: skip
@@ -1679,11 +1795,14 @@ def show_call(
     chunk: int,
     log: Any,
     ui: Ui | None,
+    frame_age_ms: float = 0.0,
 ) -> None:
-    """Print, log and show one answer with rows (``call``), the chunk ``chunk`` of the session."""
+    """Print, log and show one answer with rows (``call``), the chunk ``chunk``
+    of the session; ``frame_age_ms`` is the oldest frame since the last one."""
     policy_ms = float(call.served.get("infer_ms", 0.0))
     print(f"chunk {chunk}: {len(call.rows)} rows, rtt {call.seconds * 1e3:.0f} ms "
-          f"(policy {policy_ms:.0f} ms), stack {call.stack}", flush=True)  # fmt: skip
+          f"(policy {policy_ms:.0f} ms), stack {call.stack}, frame age max "
+          f"{frame_age_ms:.0f} ms", flush=True)  # fmt: skip
     if ui is not None:
         ui.update(phase="dry run" if a.dry_run else "running", rows=len(call.rows),
                   rtt_ms=round(call.seconds * 1e3), policy_ms=round(policy_ms),
@@ -1697,7 +1816,8 @@ def show_call(
     if log is not None:
         log.write(json.dumps({"chunk": chunk, "rtt_ms": call.seconds * 1e3,
                               "anchor": call.anchor.tolist(), "targets": call.rows.tolist(),
-                              "prompt": call.prompt, "served": call.served}) + "\n")  # fmt: skip
+                              "prompt": call.prompt, "served": call.served,
+                              "frame_age_ms": frame_age_ms}) + "\n")  # fmt: skip
         log.flush()
 
 
@@ -1715,10 +1835,12 @@ def run_session(
     and the fitted frame of each view, :func:`read_entry`) and gives it to the
     policy. The policy answers the row target of the stack's trajectory player,
     and the arm gets it in ``sub`` commands at ``--control-hz``, interpolated
-    from the previous target (:func:`interpolate_rows`). A deadline that passed
-    during a stall slips: the next deadline is one period after now, so a
-    stall slows the arm down and the rows that were due are not sent back to
-    back.
+    from the previous target (:func:`interpolate_rows`). The rows stay on the
+    time grid of the policy: the read and the step of a row stay inside its
+    period (:func:`next_tick`), and after a stall the player skips the rows
+    whose time passed (the arm goes to the row that is due, never to the
+    overdue rows back to back). The end of the session logs the counts of
+    the player (:func:`report_schedule`).
     ``--max-chunks`` ends the session after that many answers with rows have
     played; the answers that arrive after the last counted one are not shown,
     logged or counted. A
@@ -1763,6 +1885,8 @@ def run_session(
         cmd: np.ndarray | None = None  # the last command that went out
         seen = 0  # the answers with rows so far
         played = rows = 0  # the rows played of the last answer, and its rows
+        age_max = 0.0  # the oldest frame (ms) since the last answer shown
+        due_ns: int | None = None  # the time of the next step of the policy
         tick = time.monotonic()
         while True:
             if stop is not None and stop():
@@ -1771,11 +1895,20 @@ def run_session(
                 prompt = ui.get_prompt()
                 print(f"[client] prompt: {prompt!r}", flush=True)
             entry = read_entry(robot, views, ui)
+            ages = [x for x in entry.get("frame_age_ms", {}).values() if x is not None]
+            age_max = max([age_max, *ages])
             obs = observation(
                 entry["state"], {v: entry[v] for v in views}, prompt, grip
             )
+            if due_ns is not None and not a.fake_robot:
+                # the step waits for the row that is due within a quarter row:
+                # a step a little early (sleep jitter) would leave the row for
+                # the next step, which then skips it
+                lead = (due_ns - clock()) / 1e9
+                if 0.0 < lead <= sub * period / 4:
+                    time.sleep(lead)
             try:
-                steps, _ = run.step(obs)
+                steps, due_ns = run.step(obs)
             except Exception as e:  # an error answer, a lost connection, a bad answer
                 text = str(e).removeprefix("Server error: ")
                 raise SessionError(f"server error: {text}") from e
@@ -1787,7 +1920,8 @@ def run_session(
                     # session still ends when that one played out.
                     seen += 1
                     continue
-                show_call(a, call, seen, log, ui)
+                show_call(a, call, seen, log, ui, age_max)
+                age_max = 0.0
                 seen, played, rows = seen + 1, 0, len(call.rows)
             if stop is not None and stop():
                 raise StopRun
@@ -1801,14 +1935,42 @@ def run_session(
                                 paced=not a.fake_robot)  # fmt: skip
                 cmd, played = safe, played + 1
             else:
-                tick = max(tick, time.monotonic()) + sub * period
+                tick = next_tick(tick, sub * period)
                 if not a.fake_robot:
                     time.sleep(max(0.0, tick - time.monotonic()))
             if a.max_chunks and seen >= a.max_chunks and played >= rows:
                 return
     finally:
         wait.done()
+        if (runtime := getattr(run, "runtime", None)) is not None:
+            report_schedule(runtime.metadata_snapshot())
         run.close()
+
+
+def report_schedule(meta: cabc.Mapping[str, Any]) -> dict[str, float]:
+    """Print the counts that Positronic's trajectory player keeps in
+    the session metadata (``eval.schedule.*``): the rows scheduled, emitted
+    and dropped, how late they went out. Warn when more than
+    :data:`DROPPED_WARN` of the rows were dropped and the late p90 is over half
+    a row (rtc also drops the rows an overlapping chunk replaced on time).
+    Return the counts."""
+    pre = "eval.schedule."
+    stats = {
+        k.removeprefix(pre): float(v) for k, v in meta.items() if k.startswith(pre)
+    }
+    planned = stats.get("scheduled", 0.0)
+    if planned <= 0:
+        return stats
+    dropped = stats.get("dropped", 0.0)
+    say(f"[client] rows: {planned:.0f} scheduled, {stats.get('emitted', 0.0):.0f} "
+        f"played, {dropped:.0f} skipped; late p50 {stats.get('late_p50_ms', 0.0):.0f} "
+        f"ms, p90 {stats.get('late_p90_ms', 0.0):.0f} ms, max "
+        f"{stats.get('late_max_ms', 0.0):.0f} ms")  # fmt: skip
+    late = stats.get("late_p90_ms", 0.0) > 500 / FPS  # rtc's replaced rows are on time
+    if dropped / planned > DROPPED_WARN and late:
+        say(f"WARNING: {dropped / planned:.0%} of the rows were skipped: the loop "
+            "falls behind the row clock (a slow camera, USB or CPU)")  # fmt: skip
+    return stats
 
 
 def hold(robot: Any, dry: bool) -> None:
@@ -1922,6 +2084,11 @@ def main(argv: list[str] | None = None) -> None:
     views = list(cams)
     robot = make_robot(a, cams)
     robot.connect()
+    try:
+        check_cameras(robot, views)
+    except SystemExit:
+        robot.disconnect()
+        raise
     if a.measure_grip:
         try:
             closed, opened = measure_grip(robot)

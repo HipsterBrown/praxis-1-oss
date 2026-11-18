@@ -205,6 +205,53 @@ def test_a_stalled_read_slows_the_rows_down_instead_of_bursting_them(
     )
 
 
+class _SlowReadRobot(_StallingRobot):
+    """A fake robot whose every read takes ``stall_s``."""
+
+    def get_observation(self) -> dict:
+        obs = super().get_observation()  # records the start of the read
+        self.clock.t += self.stall_s
+        return obs
+
+
+def test_a_read_just_under_a_period_keeps_the_grid_without_bunching(
+    client: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read of 32 ms on each row at 30 Hz commands stays on the grid, and the
+    second command of a row still goes out half a control period or more after
+    the first: the grid alone sent it 1.3 ms after."""
+    clock = _Clock()
+    monkeypatch.setattr(client, "time", clock)
+    sub, period = 2, 1.0 / (client.FPS * 2)
+    robot = _SlowReadRobot(clock, client.JOINTS, stall_on_read=0, stall_s=0.032)
+    rows = np.cumsum(np.ones((8, 6)), axis=0)
+    last, tick = np.zeros(6), clock.t
+    for i, row in enumerate(rows):
+        if i:
+            client.read_entry(robot, [])
+        tick = client.send_row(robot, last, row, sub, period, tick, False, paced=True)
+        last = row
+    assert len(robot.sends) == len(rows) * sub
+    assert np.diff(robot.sends).min() >= period / 2 - 1e-9, np.diff(robot.sends)
+    np.testing.assert_allclose(np.diff(robot.reads), sub * period)
+
+
+@pytest.mark.parametrize(("late_p90_ms", "warns"), [(0.0, False), (55.0, True)])
+def test_skipped_rows_warn_only_when_they_went_out_late(
+    client: types.ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    late_p90_ms: float,
+    warns: bool,
+) -> None:
+    """rtc drops the rows an overlapping chunk replaced on time: a third of
+    the rows skipped with a late p90 of 0 ms is a healthy session; with a late
+    p90 over half a row, the loop falls behind."""
+    pre = "eval.schedule."
+    meta = {f"{pre}scheduled": 114, f"{pre}emitted": 64, f"{pre}dropped": 38}
+    client.report_schedule({**meta, f"{pre}late_p90_ms": late_p90_ms})
+    assert ("WARNING" in capsys.readouterr().out) is warns
+
+
 def test_the_rest_pose_check_names_the_joints_that_are_far(
     client: types.ModuleType,
 ) -> None:

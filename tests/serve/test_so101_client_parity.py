@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import importlib.util
 import json
+import math
 import sys
 import threading
 import time
@@ -66,7 +67,8 @@ def old() -> types.ModuleType:
 
 
 class _Clock:
-    """A ``time`` whose clock moves only in ``sleep``."""
+    """A ``time`` whose clock moves only in ``sleep`` (and in the reads of a
+    :class:`_SlowRobot`)."""
 
     def __init__(self) -> None:
         self.t = 1000.0
@@ -76,6 +78,8 @@ class _Clock:
 
     def sleep(self, seconds: float) -> None:
         self.t += max(0.0, seconds)
+
+    perf_counter = monotonic  # the capture times of a camera
 
 
 class _Replay:
@@ -166,10 +170,13 @@ def _drive(
     monkeypatch: pytest.MonkeyPatch,
     schedule: str,
     log: Path,
+    robot: _Replay | None = None,
 ) -> tuple[_Replay, list[dict]]:
-    """``client.main`` on a replay robot for ``CHUNKS`` chunks; return the robot and the log records."""
-    clock = _Clock()
-    robot = _Replay(clock, client.JOINTS, ["exterior"])
+    """``client.main`` on a replay robot (``robot``, by default a new one) for
+    ``CHUNKS`` chunks; return the robot and the log records."""
+    if robot is None:
+        robot = _Replay(_Clock(), client.JOINTS, ["exterior"])
+    clock = robot.clock
     monkeypatch.setattr(client, "time", clock)
     monkeypatch.setattr(client, "make_robot", lambda a, cams: robot)
     if hasattr(client, "PolicyRun"):
@@ -263,3 +270,144 @@ def test_only_an_so101_server_without_half_frame_offsets_is_refused(
     monkeypatch.setitem(policy.RESTRICT_SQUARE, "so101", (True, False))
     meta = serve._rtc_factory()({"schedule": schedule}).meta
     assert len(new.on_grid_offsets(meta)) == (24 if schedule == "chunked" else 0)
+
+
+class _Camera:
+    """A LeRobot camera on the virtual clock: its reader thread has frame ``k``
+    (the frame of its row) at ``t0 + k * period_s``. ``read_latest`` gives the
+    newest frame at once; ``async_read`` waits (the clock moves) for a frame
+    newer than the last one it gave, as LeRobot's OpenCV camera waits for
+    ``new_frame_event`` and clears it."""
+
+    def __init__(self, robot: _SlowRobot, period_s: float) -> None:
+        self.robot, self.period_s = robot, period_s
+        self.taken = -1  # the last frame async_read gave
+
+    def _latest(self) -> int:
+        return math.floor((self.robot.clock.t - self.robot.t0) / self.period_s + 1e-9)
+
+    def _frame(self, k: int) -> np.ndarray:
+        return serve._frame(float(round(k * self.period_s * 15.0)), 240, 320)
+
+    @property
+    def latest_timestamp(self) -> float:
+        return self.robot.t0 + self._latest() * self.period_s
+
+    def read_latest(self, max_age_ms: int = 500) -> np.ndarray:
+        age_ms = (self.robot.clock.t - self.latest_timestamp) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(f"latest frame is too old: {age_ms:.1f} ms")
+        return self._frame(self._latest())
+
+    def async_read(self, timeout_ms: float = 200) -> np.ndarray:
+        k = max(self._latest(), self.taken + 1)
+        self.robot.clock.sleep(self.robot.t0 + k * self.period_s - self.robot.clock.t)
+        self.taken = k
+        return self._frame(k)
+
+
+class _SlowRobot(_Replay):
+    """A replay robot whose reading takes ``read_s`` of the virtual clock (the
+    motor bus and the frame together). With ``camera_s`` it has a LeRobot
+    camera at that period and a motor bus, and ``get_observation`` is the one
+    of LeRobot 0.4.3 and earlier: ``async_read``, which waits for a new frame."""
+
+    def __init__(
+        self,
+        clock: _Clock,
+        joints: tuple[str, ...],
+        read_s: float = 0.0,
+        camera_s: float = 0.0,
+    ) -> None:
+        super().__init__(clock, joints, ["exterior"])
+        self.read_s = read_s
+        if camera_s:
+            self.bus = self
+            self.cameras = {"exterior": _Camera(self, camera_s)}
+
+    def sync_read(self, name: str, **_: object) -> dict[str, float]:
+        assert name == "Present_Position"
+        return dict(zip(self.joints, map(float, self.q), strict=True))
+
+    def get_observation(self) -> dict:
+        self.clock.sleep(self.read_s)
+        if not hasattr(self, "cameras"):
+            return super().get_observation()
+        obs: dict = {
+            f"{j}.pos": v for j, v in self.sync_read("Present_Position").items()
+        }
+        return {**obs, "exterior": self.cameras["exterior"].async_read()}
+
+
+def _drive_slow(
+    client: types.ModuleType,
+    addr: str,
+    monkeypatch: pytest.MonkeyPatch,
+    log: Path,
+    **slow: float,
+) -> tuple[int, int]:
+    """``client.main`` on a :class:`_SlowRobot` (``slow``), ``periodic_chunked``;
+    return the rows played and the rows answered."""
+    robot = _SlowRobot(_Clock(), client.JOINTS, **slow)
+    _, records = _drive(client, addr, monkeypatch, "periodic_chunked", log, robot)
+    # the last command is the hold of the reading after the session
+    return len(robot.sent) - 1, sum(len(r["targets"]) for r in records)
+
+
+@pytest.mark.parametrize("camera_s", [0.12, 1 / 7.5])
+def test_a_slow_camera_does_not_skip_rows(
+    new: types.ModuleType,
+    server: tuple[str, list[dict]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    camera_s: float,
+) -> None:
+    """A camera that gives a frame every 0.12 s (or at 7.5 Hz) on the 15 Hz
+    rows: the entry takes the latest frame (repeated on the next row) and the
+    joints at once, so the rows answered are played. ``async_read`` waited for
+    each new frame: 63 rows of 93 went out (59 at 7.5 Hz)."""
+    played, answered = _drive_slow(
+        new, server[0], monkeypatch, tmp_path / "s.jsonl", camera_s=camera_s
+    )
+    assert played == answered, (played, answered)
+
+
+def test_a_paced_read_keeps_the_row_grid(
+    new: types.ModuleType,
+    server: tuple[str, list[dict]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A reading of 20 ms on each row stays inside the row period: the next
+    deadline is on the grid, not 20 ms after it. A deadline that slipped by
+    the reading made each row 87 ms, and the player skipped 15 rows of 93."""
+    played, answered = _drive_slow(
+        new, server[0], monkeypatch, tmp_path / "s.jsonl", read_s=0.02
+    )
+    assert played == answered, (played, answered)
+
+
+def test_a_frozen_camera_ends_the_session(
+    new: types.ModuleType,
+    server: tuple[str, list[dict]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A camera that stops at 2 s: past ``MAX_FRAME_AGE_MS`` the client says so
+    and waits, and after ``FRAME_WAIT_S`` the session ends; no row plays the
+    frozen frame past the bar."""
+    robot = _SlowRobot(_Clock(), new.JOINTS, camera_s=1 / 30)
+    cam = robot.cameras["exterior"]
+    frozen = math.floor(2.0 * 30)
+    latest = cam._latest
+    monkeypatch.setattr(cam, "_latest", lambda: min(latest(), frozen))
+    with pytest.raises(SystemExit, match="a camera sends no frame"):
+        _drive(
+            new, server[0], monkeypatch, "periodic_chunked", tmp_path / "s.jsonl", robot
+        )
+    assert "no frame within 200 ms" in capsys.readouterr().out
+    assert (
+        robot.clock.t - robot.t0
+        < 2.0 + new.MAX_FRAME_AGE_MS / 1e3 + new.FRAME_WAIT_S + 0.5
+    )
